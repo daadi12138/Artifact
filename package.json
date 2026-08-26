@@ -9,9 +9,10 @@
     "artifact": "dist-cli/cli.js"
   },
   "scripts": {
-    "dev": "next dev --hostname 127.0.0.1",
+    "dev": "next dev -p 3000 -H 0.0.0.0",
     "build": "next build",
-    "start": "next start --hostname 127.0.0.1",
+    "start": "next start -p 3000 -H 0.0.0.0",
+    "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "core:typecheck": "tsc --noEmit",
     "test": "node --test --import tsx src/**/*.test.ts",

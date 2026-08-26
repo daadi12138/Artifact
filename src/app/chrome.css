@@ -2212,3 +2212,187 @@
   .console-artifact { transition: none !important; }
   .run-workspace .spin { animation: none !important; }
 }
+
+/* ==========================================================================
+   Design Proposals Preview Modal - Self-Contained Styles
+   ========================================================================== */
+.proposal-modal-backdrop {
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 99999 !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 24px !important;
+  background: rgba(15, 23, 42, 0.75) !important;
+  backdrop-filter: blur(8px) !important;
+  -webkit-backdrop-filter: blur(8px) !important;
+  overflow-y: auto !important;
+}
+
+.proposal-modal-dialog {
+  position: relative !important;
+  display: flex !important;
+  flex-direction: column !important;
+  width: 100% !important;
+  max-width: 980px !important;
+  max-height: 90vh !important;
+  background: #0f172a !important;
+  color: #f8fafc !important;
+  border: 1px solid #334155 !important;
+  border-radius: 12px !important;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5) !important;
+  overflow: hidden !important;
+}
+
+.proposal-modal-header {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  padding: 16px 24px !important;
+  background: #090d16 !important;
+  border-bottom: 1px solid #1e293b !important;
+}
+
+.proposal-modal-title {
+  display: flex !important;
+  align-items: center !important;
+  gap: 12px !important;
+}
+
+.proposal-modal-icon {
+  display: grid !important;
+  place-items: center !important;
+  width: 36px !important;
+  height: 36px !important;
+  border-radius: 8px !important;
+  background: rgba(99, 102, 241, 0.15) !important;
+  color: #818cf8 !important;
+  border: 1px solid rgba(99, 102, 241, 0.3) !important;
+}
+
+.proposal-modal-title h2 {
+  margin: 0 !important;
+  font-size: 16px !important;
+  font-weight: 700 !important;
+  color: #f8fafc !important;
+}
+
+.proposal-modal-title p {
+  margin: 2px 0 0 0 !important;
+  color: #94a3b8 !important;
+  font-size: 12px !important;
+}
+
+.proposal-modal-close {
+  display: grid !important;
+  place-items: center !important;
+  width: 32px !important;
+  height: 32px !important;
+  padding: 0 !important;
+  border: 1px solid #334155 !important;
+  border-radius: 6px !important;
+  background: #1e293b !important;
+  color: #94a3b8 !important;
+  cursor: pointer !important;
+  transition: all 120ms ease !important;
+}
+
+.proposal-modal-close:hover {
+  background: #334155 !important;
+  color: #ffffff !important;
+}
+
+.proposal-tabs-grid {
+  display: grid !important;
+  grid-template-columns: repeat(3, 1fr) !important;
+  gap: 12px !important;
+  padding: 16px 24px !important;
+  background: #020617 !important;
+  border-bottom: 1px solid #1e293b !important;
+}
+
+.proposal-tab-card {
+  display: flex !important;
+  flex-direction: column !important;
+  padding: 12px 14px !important;
+  border: 1px solid #334155 !important;
+  border-radius: 8px !important;
+  background: #0f172a !important;
+  text-align: left !important;
+  cursor: pointer !important;
+  transition: all 160ms ease !important;
+}
+
+.proposal-tab-card:hover {
+  border-color: #475569 !important;
+  background: #1e293b !important;
+}
+
+.proposal-tab-card.active {
+  border-color: #6366f1 !important;
+  background: rgba(49, 46, 129, 0.4) !important;
+  box-shadow: 0 0 0 1px #6366f1 !important;
+}
+
+.proposal-tab-category {
+  display: inline-block !important;
+  align-self: flex-start !important;
+  padding: 2px 6px !important;
+  border-radius: 4px !important;
+  background: #1e293b !important;
+  color: #cbd5e1 !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  margin-bottom: 6px !important;
+}
+
+.proposal-tab-card.active .proposal-tab-category {
+  background: rgba(99, 102, 241, 0.25) !important;
+  color: #a5b4fc !important;
+}
+
+.proposal-tab-title {
+  font-size: 13px !important;
+  font-weight: 700 !important;
+  color: #f1f5f9 !important;
+}
+
+.proposal-tab-subtitle {
+  margin-top: 2px !important;
+  color: #94a3b8 !important;
+  font-size: 11px !important;
+}
+
+.proposal-body {
+  flex: 1 !important;
+  padding: 24px !important;
+  overflow-y: auto !important;
+  background: #0b0f19 !important;
+}
+
+.proposal-detail-grid {
+  display: grid !important;
+  grid-template-columns: 1.25fr 1fr !important;
+  gap: 24px !important;
+  align-items: stretch !important;
+}
+
+.proposal-visual-preview {
+  border: 1px solid #1e293b !important;
+  border-radius: 8px !important;
+  background: #020617 !important;
+  color: #e2e8f0 !important;
+  padding: 16px !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+.proposal-footer {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: space-between !important;
+  padding: 14px 24px !important;
+  background: #090d16 !important;
+  border-top: 1px solid #1e293b !important;
+}
