@@ -1,8 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { AlignHorizontalSpaceAround, Bot, ChevronLeft, ChevronRight, Ellipsis, Focus, FolderCog, History, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Plus, Scan, Settings, Sparkles, Upload, Workflow, X } from 'lucide-react'
-import { DesignProposalsModal } from './design-proposals-modal'
+import { AlignHorizontalSpaceAround, Bot, ChevronLeft, ChevronRight, Ellipsis, Focus, FolderCog, History, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Plus, Scan, Settings, Upload, Workflow, X } from 'lucide-react'
 import { ExecutorSettings, SettingsOverview } from './executor-settings'
 import { RunWorkspace } from './run-workspace'
 import { WorkflowLibraryView, type WorkflowRecordView, type WorkflowTemplateView } from './workflow-library'
@@ -155,8 +154,6 @@ function arrangeWorkflowNodes(nodes: WorkflowNode[], edges: Edge[]): WorkflowNod
 
 export default function HomePage() {
   const [activeView, setActiveView] = useState('settings')
-  const [proposalsOpen, setProposalsOpen] = useState(false)
-  const [currentProposal, setCurrentProposal] = useState('proposal-1')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [sidebarWidth, setSidebarWidth] = useState(defaultSidebarWidth)
   const [inspectorWidth, setInspectorWidth] = useState(defaultInspectorWidth)
@@ -621,41 +618,11 @@ export default function HomePage() {
         {activeView === 'artifacts' && <><div className="context-summary"><span className="context-icon"><Package aria-hidden="true" /></span><div><b>Artifact Registry</b><small>按 Schema 和运行保存产物</small></div></div><button className="context-action" onClick={() => selectView('runs')}>查看来源运行 <ChevronRight aria-hidden="true" /></button></>}
         {activeView === 'settings' && <><button className={`context-item ${settingsPage === 'overview' ? 'active' : ''}`} onClick={() => setSettingsPage('overview')}><span className="context-icon"><FolderCog aria-hidden="true" /></span><span><b>项目与环境</b><small>项目、Worktree 与命令</small></span></button><button className={`context-item ${settingsPage === 'executors' ? 'active' : ''}`} onClick={() => setSettingsPage('executors')}><span className="context-icon"><Bot aria-hidden="true" /></span><span><b>执行器</b><small>连接和管理 Agent Runtime</small></span></button></>}
       </div>
-      <div className="sidebar-bottom">
-        <button
-          type="button"
-          className="flex items-center justify-center gap-1.5 w-full mb-2 py-1.5 px-2 rounded-md bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold transition-colors"
-          onClick={() => setProposalsOpen(true)}
-        >
-          <Sparkles className="w-3.5 h-3.5" /> 体验重构方案图
-        </button>
-        <div className="runtime"><span className="online" />本地运行时</div>
-      </div>
+      <div className="sidebar-bottom"><div className="runtime"><span className="online" />本地运行时</div></div>
     </aside>
     <button className="sidebar-resizer" type="button" role="separator" aria-label="调整主侧栏宽度" aria-orientation="vertical" aria-valuemin={minSidebarWidth} aria-valuemax={maxSidebarWidth} aria-valuenow={sidebarWidth} tabIndex={sidebarCollapsed ? -1 : 0} onPointerDown={startSidebarResize} onPointerMove={resizeSidebar} onPointerUp={finishSidebarResize} onPointerCancel={finishSidebarResize} onKeyDown={adjustSidebarWidth} onDoubleClick={() => updateSidebarWidth(defaultSidebarWidth)} />
     <main className="workspace">
-      <header className="workspace-header">
-        <div className="header-leading">
-          <div className="breadcrumb">
-            <span>{projectName}</span><i>/</i><b>{activeNavItem?.label}</b>
-            {activeView === 'workflow' && workflowMode === 'editor' && selectedWorkflow && <><i>/</i><b>{selectedWorkflow.draft.name}</b></>}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            className="run-btn"
-            style={{ fontSize: '11px', padding: '6px 12px', background: '#6366f1', borderColor: '#4f46e5' }}
-            onClick={() => setProposalsOpen(true)}
-            title="点击查看三种重构方案效果图"
-          >
-            <Sparkles style={{ width: '14px', height: '14px' }} />
-            <span>查看 3 种重构效果图</span>
-          </button>
-          {activeView === 'workflow' && workflowMode === 'editor' && <span className={`saved ${draftSaveState}`}><i />{draftSaveState === 'saving' ? '保存中' : draftSaveState === 'error' ? '保存失败' : '已保存'}</span>}
-        </div>
-        <input ref={importInputRef} type="file" accept="application/json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importWorkflow(file); event.currentTarget.value = '' }} />
-      </header>
+      <header className="workspace-header"><div className="header-leading"><div className="breadcrumb"><span>{projectName}</span><i>/</i><b>{activeNavItem?.label}</b>{activeView === 'workflow' && workflowMode === 'editor' && selectedWorkflow && <><i>/</i><b>{selectedWorkflow.draft.name}</b></>}</div></div>{activeView === 'workflow' && workflowMode === 'editor' && <span className={`saved ${draftSaveState}`}><i />{draftSaveState === 'saving' ? '保存中' : draftSaveState === 'error' ? '保存失败' : '已保存'}</span>}<input ref={importInputRef} type="file" accept="application/json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importWorkflow(file); event.currentTarget.value = '' }} /></header>
       {activeView === 'workflow' && workflowMode === 'library' ? <WorkflowLibraryView workflows={workflows} templates={templates} busyId={workflowBusyId} onCreate={template => void createWorkflow(template)} onEdit={openWorkflowEditor} onPublish={workflow => void publishWorkflow(workflow)} onLaunch={() => selectView('runs')} /> : activeView === 'workflow' ? <WorkflowView workflowName={selectedWorkflow?.draft.name ?? '工作流'} publishedRevision={selectedWorkflow?.published.at(-1)?.revision} saveState={draftSaveState} nodes={nodes} edges={edges} selectedId={selectedId} logs={logs} workflowReady={workflowReady && Boolean(selectedWorkflowId)} inspectorVisible={hasInspector} dragRef={dragRef} onSelect={setSelectedId} onMove={setNodes} onConnect={connectSelectedTo} onAddNode={addNode} onArrange={arrangeWorkflow} onImport={() => importInputRef.current?.click()} onExport={exportWorkflow} onToggleInspector={() => setInspectorVisible(value => !value)} onBack={openWorkflowLibrary} onPublish={publishSelectedWorkflow} publishing={workflowBusyId === `publish:${selectedWorkflowId}`} /> : activeView === 'runs' ? <RunWorkspace workflows={workflows} onEditWorkflow={openWorkflowEditor} /> : activeView === 'artifacts' ? <ArtifactView /> : settingsPage === 'executors' ? <ExecutorSettings onBack={() => setSettingsPage('overview')} /> : <SettingsOverview onExecutors={() => setSettingsPage('executors')} onOpenWorkflow={openWorkflowLibrary} executorConfigured={executorOptions.some(executor => executor.connected)} />}
       <footer className="status-bar"><div className="status-group"><span className="status-item project-status"><i />{projectName}</span><span className="status-item">{runStatus ? runStatusLabel(runStatus) : '就绪'}</span></div><div className="status-group"><span className="status-item">本地运行时</span><span className="status-item">Artifact 0.1.0</span></div></footer>
     </main>
@@ -679,14 +646,6 @@ export default function HomePage() {
         </>}
       </aside>
     </>}
-
-    <DesignProposalsModal
-      isOpen={proposalsOpen}
-      onClose={() => setProposalsOpen(false)}
-      selectedProposal={currentProposal}
-      onSelectProposal={setCurrentProposal}
-      onApplyProposal={setCurrentProposal}
-    />
   </div>
 }
 

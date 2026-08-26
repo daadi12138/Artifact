@@ -1,6 +1,0 @@
-{
-  "name": "Artifact",
-  "description": "Local-first workflow console for coding agents",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
