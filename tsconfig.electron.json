@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "incremental": false,
+    "isolatedModules": false,
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "outDir": "dist-electron",
+    "rootDir": ".",
+    "types": ["node", "electron"]
+  },
+  "include": ["electron/**/*.ts", "src/core/index.ts"],
+  "exclude": ["node_modules", ".next", "dist-electron"]
+}

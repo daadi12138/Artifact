@@ -1,0 +1,83 @@
+{
+  "name": "artifact",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-first workflow console for coding agents",
+  "author": "Artifact Contributors",
+  "main": "dist-electron/electron/main.js",
+  "bin": {
+    "artifact": "dist-cli/cli.js"
+  },
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1",
+    "build": "next build",
+    "start": "next start --hostname 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "core:typecheck": "tsc --noEmit",
+    "test": "node --test --import tsx src/**/*.test.ts",
+    "artifact": "tsx src/cli.ts",
+    "cli:build": "tsc -p tsconfig.cli.json && chmod +x dist-cli/cli.js",
+    "electron:compile": "tsc -p tsconfig.electron.json",
+    "electron:doctor": "node scripts/electron-doctor.mjs",
+    "electron:dev": "node scripts/electron-dev.mjs",
+    "desktop:prepare": "node scripts/prepare-standalone.mjs",
+    "electron:build": "npm run build && npm run desktop:prepare && npm run electron:compile && npm run cli:build",
+    "clean": "node scripts/clean-build.mjs",
+    "dist:mac": "npm run electron:build && npm run package:mac",
+    "dist:mac:clean": "npm run clean && npm run dist:mac",
+    "package:mac": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir zip --arm64",
+    "dist:dmg": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg --arm64 --prepackaged release/mac-arm64/Artifact.app",
+    "dist:all:clean": "npm run clean && npm run dist:mac && npm run dist:dmg"
+  },
+  "dependencies": {
+    "lucide-react": "^1.34.0",
+    "next": "^15.5.23",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "electron": "^43.4.1",
+    "electron-builder": "^26.15.3",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
+  },
+  "build": {
+    "appId": "com.artifact.desktop",
+    "productName": "Artifact",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": ".next/standalone",
+        "to": "app-next"
+      },
+      {
+        "from": ".next/static",
+        "to": "app-next/.next/static"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dir",
+        "dmg",
+        "zip"
+      ],
+      "identity": null,
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    },
+    "dmg": {
+      "sign": false
+    }
+  }
+}
