@@ -31,14 +31,14 @@ npm run cli:build
 ./dist-cli/cli.js open /path/to/project
 ```
 
-`dist:mac` creates an unsigned Apple Silicon app, DMG and ZIP under `release/`. Signing and notarization are intentionally disabled for local testing; macOS may require Control-clicking the app and choosing Open on first launch.
+`dist:mac` creates an unsigned Apple Silicon app bundle and ZIP under `release/`. Use `npm run dist:all:clean` to rebuild the app, ZIP, and DMG from a clean tree. Signing and notarization are intentionally disabled for local testing; macOS may require Control-clicking the app and choosing Open on first launch.
 
 ## Included in this release
 
-- Git project import with detected Node.js commands and an explicit environment confirmation gate.
+- Git project import with detected Node.js commands and approval before an unreviewed validation command runs.
 - A dedicated Git Worktree and temporary branch for every Run; the imported working directory is never used for Agent writes.
 - Drag-and-drop workflow canvas with persisted prompts, node library, and configurable executors.
-- Codex and Claude Code runtime configuration persisted under `.artifact/executors.json`, including live CLI probes, authorization state, and reviewed model selection.
+- Codex and Claude Code runtime configuration persisted in the Artifact state directory, including live CLI probes, authorization state, and reviewed model selection.
 - DAG validation for duplicate nodes, invalid edges, self edges, and cycles.
 - Durable, atomic Run manifests with frozen project/environment snapshots and per-step Attempt history.
 - Approval, rejection, cancellation, failed-step retry, and automatic `process_lost` recovery after a service restart.
@@ -50,7 +50,7 @@ npm run cli:build
 
 ## Deliberate boundaries
 
-This is a single-user, local-first release bound to `127.0.0.1`. Agent changes are isolated in `.artifact/worktrees/`; Artifact never commits, pushes, opens PRs, merges, or deploys. The current release has production adapters for Codex and Claude Code. Gemini CLI, Grok Build, OpenCode, Pi, and delegated subagents require the next adapter-protocol milestone before they are exposed in the UI. Playwright, Figma import, and Visual QA remain outside this core release.
+This is a single-user, local-first release bound to `127.0.0.1`. Agent changes are isolated under the Artifact state directory's `worktrees/`; Artifact never commits, pushes, opens PRs, merges, or deploys. Web and CLI use `.artifact/` by default, Electron development uses `.artifact-desktop-dev/`, and the packaged desktop app uses its application-data directory. The current release has production adapters for Codex and Claude Code. Gemini CLI, Grok Build, OpenCode, Pi, and delegated subagents require the next adapter-protocol milestone before they are exposed in the UI. Playwright, Figma import, and Visual QA remain outside this core release.
 
 ## Agent authentication and models
 
@@ -66,4 +66,4 @@ npm test
 npm run build
 ```
 
-Runtime state is intentionally excluded from source control through `.gitignore`.
+Repository-local runtime state is intentionally excluded from source control through `.gitignore`.
