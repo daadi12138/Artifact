@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { AlertTriangle, ArrowLeft, ArrowUp, Check, Copy, Download, ExternalLink, Moon, RefreshCw, ScanSearch, Sun } from 'lucide-react'
 
 type ExecutorEnvironmentState = 'ready' | 'discovered' | 'update_available' | 'not_installed' | 'error'
 type ExecutorAuthenticationState = 'authenticated' | 'api_key' | 'needs_login' | 'unknown'
@@ -24,8 +25,51 @@ const futureExecutors = [
 
 type SetupStep = 1 | 2 | 3
 type ProjectMode = 'idle' | 'create' | 'manual-import'
+type InterfaceTheme = 'dark' | 'light'
+type FeedbackNotice = { kind: 'success' | 'error'; text: string }
+type FeedbackNoticeState = FeedbackNotice & { id: number }
+type SettingsOverviewProps = {
+  onExecutors: () => void
+  onOpenWorkflow: () => void
+  executorConfigured: boolean
+  theme: InterfaceTheme
+  onThemeChange: (theme: InterfaceTheme) => void
+}
 
-export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigured }: { onExecutors: () => void; onOpenWorkflow: () => void; executorConfigured: boolean }) {
+function useTransientNotice(durationMs = 2_000) {
+  const [notice, setNoticeState] = useState<FeedbackNoticeState | null>(null)
+  const nextNoticeId = useRef(0)
+
+  const setNotice = (next: FeedbackNotice | null) => {
+    if (!next) {
+      setNoticeState(null)
+      return
+    }
+    nextNoticeId.current += 1
+    setNoticeState({ ...next, id: nextNoticeId.current })
+  }
+
+  useEffect(() => {
+    if (!notice) return
+    const timer = window.setTimeout(() => {
+      setNoticeState(current => current === notice ? null : current)
+    }, durationMs)
+    return () => window.clearTimeout(timer)
+  }, [durationMs, notice])
+
+  return [notice, setNotice] as const
+}
+
+function FeedbackToast({ notice }: { notice: FeedbackNoticeState | null }) {
+  if (!notice) return null
+  const Icon = notice.kind === 'error' ? AlertTriangle : Check
+  return <div key={notice.id} className={`feedback-toast ${notice.kind}`} role={notice.kind === 'error' ? 'alert' : 'status'} aria-atomic="true">
+    <span className="feedback-toast-icon"><Icon aria-hidden="true" /></span>
+    <span className="feedback-toast-message">{notice.text}</span>
+  </div>
+}
+
+export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigured, theme, onThemeChange }: SettingsOverviewProps) {
   const [project, setProject] = useState<Project | null>(null)
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([])
   const [path, setPath] = useState('')
@@ -34,9 +78,10 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
   const [newProjectName, setNewProjectName] = useState('')
   const [newProjectLocation, setNewProjectLocation] = useState('')
   const [busy, setBusy] = useState(false)
-  const [notice, setNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
-  const desktop = typeof window !== 'undefined' && Boolean(window.artifactDesktop)
+  const [notice, setNotice] = useTransientNotice()
+  const [desktop, setDesktop] = useState(false)
   const load = () => { void fetch('/api/project').then(response => response.json()).then((value: { project: Project | null; recentProjects?: RecentProject[] }) => { setProject(value.project); setRecentProjects(value.recentProjects ?? []); setPath(''); setNewProjectLocation(''); if (value.project) setActiveStep(3) }).catch(() => undefined) }
+  useEffect(() => { setDesktop(Boolean(window.artifactDesktop)) }, [])
   useEffect(load, [])
   const acceptProject = (value: Project) => { setProject(value); setPath(''); setProjectMode('idle'); setActiveStep(3); setRecentProjects(current => [{ name: value.name, repositoryPath: value.repositoryPath, gitRoot: value.gitRoot, updatedAt: new Date().toISOString() }, ...current.filter(item => item.gitRoot !== value.gitRoot)].slice(0, 6)); setNotice({ kind: 'success', text: '项目已导入。连接执行器后即可开始工作流；命令会在实际运行前按需请求授权。' }); window.dispatchEvent(new Event('artifact-project-updated')) }
   const pickProject = async () => {
@@ -116,6 +161,24 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
     if (desktop) void pickProject()
     else setProjectMode('manual-import')
   }
+  const handleThemeKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    const themes: InterfaceTheme[] = ['dark', 'light']
+    const currentIndex = themes.indexOf(theme)
+    const nextIndex = event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+      ? (currentIndex + themes.length - 1) % themes.length
+      : event.key === 'ArrowRight' || event.key === 'ArrowDown'
+        ? (currentIndex + 1) % themes.length
+        : event.key === 'Home'
+          ? 0
+          : event.key === 'End'
+            ? themes.length - 1
+            : null
+    if (nextIndex === null) return
+    event.preventDefault()
+    const nextTheme = themes[nextIndex]
+    onThemeChange(nextTheme)
+    event.currentTarget.parentElement?.querySelector<HTMLButtonElement>(`[data-theme-option="${nextTheme}"]`)?.focus()
+  }
 
   const stepDetails: Record<SetupStep, { label: string; title: string; description: string }> = {
     1: { label: '项目', title: '选择一个项目', description: '导入已有 Git 仓库，或创建一个新的空项目。' },
@@ -130,7 +193,7 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
         <div><span className="section-kicker">WORKSPACE SETUP</span><h1>从项目开始</h1><p>项目和执行器准备好后即可开始；验证命令在使用时再授权。</p></div>
         <span className="setup-count">{completedSteps === 2 ? '已准备就绪' : `${completedSteps}/2 已完成`}</span>
       </header>
-      {notice && <p className={`setup-notice ${notice.kind}`} role="status">{notice.text}</p>}
+      <FeedbackToast notice={notice} />
       <ol className="setup-progress" aria-label="工作空间设置进度">
         {([1, 2, 3] as SetupStep[]).map(step => {
           const item = stepDetails[step]
@@ -172,6 +235,42 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
           {activeStep === 3 && project && <><div className={`setup-executor-status ${executorConfigured ? 'ready' : ''}`}><span>{executorConfigured ? '✓' : '✦'}</span><div><h3>{executorConfigured ? '执行器已准备就绪' : '选择一个执行器'}</h3><p>{executorConfigured ? '项目与执行器均已配置完成，可以开始第一个工作流。验证命令将在首次使用时请求授权。' : '连接 Codex 或 Claude Code，并确认各自的 CLI 登录状态。'}</p></div></div><div className="setup-stage-actions"><button className="run-btn" onClick={executorConfigured ? onOpenWorkflow : onExecutors}>{executorConfigured ? '进入工作流' : '配置执行器'}</button>{executorConfigured && <button className="ghost-btn" onClick={onExecutors}>管理执行器</button>}</div></>}
         </div>
       </section>
+
+      <section className="appearance-theme" aria-labelledby="appearance-theme-title">
+        <div className="appearance-theme-copy">
+          <span className="section-kicker">INTERFACE</span>
+          <h2 id="appearance-theme-title">界面外观</h2>
+          <p>选择适合当前环境的主题。</p>
+        </div>
+        <div className="appearance-theme-options" role="radiogroup" aria-labelledby="appearance-theme-title">
+          <button
+            type="button"
+            className={`appearance-theme-option ${theme === 'dark' ? 'active' : ''}`}
+            role="radio"
+            aria-checked={theme === 'dark'}
+            tabIndex={theme === 'dark' ? 0 : -1}
+            data-theme-option="dark"
+            onClick={() => onThemeChange('dark')}
+            onKeyDown={handleThemeKeyDown}
+          >
+            <Moon size={16} aria-hidden="true" />
+            <span><b>深色</b><small>Mission Control</small></span>
+          </button>
+          <button
+            type="button"
+            className={`appearance-theme-option ${theme === 'light' ? 'active' : ''}`}
+            role="radio"
+            aria-checked={theme === 'light'}
+            tabIndex={theme === 'light' ? 0 : -1}
+            data-theme-option="light"
+            onClick={() => onThemeChange('light')}
+            onKeyDown={handleThemeKeyDown}
+          >
+            <Sun size={16} aria-hidden="true" />
+            <span><b>亮色</b><small>Daylight</small></span>
+          </button>
+        </div>
+      </section>
     </div>
   </section>
 }
@@ -180,7 +279,7 @@ export function ExecutorSettings({ onBack }: { onBack: () => void }) {
   const [report, setReport] = useState<ExecutorEnvironmentReport | null>(null)
   const [scanning, setScanning] = useState(true)
   const [busyId, setBusyId] = useState<string | null>(null)
-  const [notice, setNotice] = useState<{ kind: 'success' | 'error'; text: string } | null>(null)
+  const [notice, setNotice] = useTransientNotice()
   const [confirmation, setConfirmation] = useState<{ ids: string[]; action: 'install' | 'update' } | null>(null)
   const [diagnostic, setDiagnostic] = useState<ExecutorInstallationDiagnostic | null>(null)
   const [modelDrafts, setModelDrafts] = useState<Record<string, string>>({})
@@ -273,13 +372,13 @@ export function ExecutorSettings({ onBack }: { onBack: () => void }) {
     const { ids, action } = confirmation
     setBusyId(action === 'update' && ids.length > 1 ? 'update-all' : `${action}:${ids[0]}`)
     setNotice(null)
+    setConfirmation(null)
     try {
       const response = await fetch('/api/executors/maintenance', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ executorIds: ids, action, confirmed: true }) })
       const value = await response.json() as { results?: Array<{ id: string; ok: boolean; error?: string }>; error?: string }
       if (!response.ok) throw new Error(value.error ?? '执行器维护失败')
       const failed = value.results?.filter(item => !item.ok) ?? []
       setNotice(failed.length ? { kind: 'error', text: `${failed.length} 个操作失败：${failed.map(item => item.error ?? item.id).join('；')}` } : { kind: 'success', text: action === 'install' ? '安装已完成，正在重新检查本地环境。' : '升级已完成，正在重新检查本地环境。' })
-      setConfirmation(null)
       await scan(true)
     } catch (error) {
       setNotice({ kind: 'error', text: error instanceof Error ? error.message : '执行器维护失败' })
@@ -290,31 +389,32 @@ export function ExecutorSettings({ onBack }: { onBack: () => void }) {
 
   const selectedForMaintenance = confirmation ? report?.executors.filter(executor => confirmation.ids.includes(executor.id)) ?? [] : []
   const updateIds = report?.executors.filter(executor => executor.state === 'update_available' && executor.installPlan).map(executor => executor.id) ?? []
+  const updateBusy = busyId === 'update-all' || busyId?.startsWith('update:') === true
   const manualCommands = report?.executors.flatMap(executor => executor.installPlan ? [`# ${executor.name}\n${executor.installPlan.display}`] : []) ?? []
 
   return <section className="executor-page environment-page">
     <div className="environment-shell">
       <header className="environment-header">
         <div>
-          <button className="back-link" onClick={onBack}>‹ 项目设置</button>
+          <button className="back-link" onClick={onBack}><ArrowLeft aria-hidden="true" />项目设置</button>
           <span className="section-kicker">LOCAL RUNTIME</span>
           <h1>Agent 运行时</h1>
           <p>当前可调度的运行时只有 Codex 与 Claude Code。每张卡片都对应一个已实现的 Run 适配器。</p>
         </div>
         <div className="environment-actions">
-          <button className="ghost-btn" onClick={() => void diagnose()} disabled={busyId === 'diagnose'}><span className="button-glyph" aria-hidden="true">⌕</span>{busyId === 'diagnose' ? '诊断中…' : '诊断安装冲突'}</button>
-          <button className="ghost-btn" onClick={() => void scan()} disabled={scanning}><span className="button-glyph" aria-hidden="true">↻</span>{scanning ? '检查中…' : '刷新'}</button>
-          <button className="run-btn" onClick={() => setConfirmation({ ids: updateIds, action: 'update' })} disabled={!updateIds.length || busyId === 'update-all'}><span className="button-glyph" aria-hidden="true">↑</span>{busyId === 'update-all' ? '升级中…' : `全部升级${updateIds.length ? ` (${updateIds.length})` : ''}`}</button>
+          <button className="ghost-btn" onClick={() => void diagnose()} disabled={busyId === 'diagnose'}><ScanSearch aria-hidden="true" />{busyId === 'diagnose' ? '诊断中…' : '诊断安装冲突'}</button>
+          <button className="ghost-btn" onClick={() => void scan()} disabled={scanning}><RefreshCw className={scanning ? 'spin' : undefined} aria-hidden="true" />{scanning ? '检查中…' : '刷新'}</button>
+          <button className="run-btn" onClick={() => setConfirmation({ ids: updateIds, action: 'update' })} disabled={!updateIds.length || updateBusy}><ArrowUp aria-hidden="true" />{updateBusy ? '升级中…' : `全部升级${updateIds.length ? ` (${updateIds.length})` : ''}`}</button>
         </div>
       </header>
 
-      {notice && <p className={`executor-notice ${notice.kind}`} role="status">{notice.text}</p>}
+      <FeedbackToast notice={notice} />
 
       <div className={`environment-grid ${scanning && !report ? 'loading' : ''}`} aria-busy={scanning}>
         {(report?.executors ?? Array.from({ length: 2 }, (_, index) => ({ id: `placeholder-${index}` } as ExecutorEnvironment))).map(executor => {
           if (!executor.name) return <div className="environment-card executor-placeholder" key={executor.id}><span /><span /><span /></div>
           const action = primaryAction(executor)
-          const actionBusy = busyId === `${action.kind}:${executor.id}`
+          const actionBusy = busyId === `${action.kind}:${executor.id}` || (action.kind === 'update' && busyId === 'update-all')
           const selectedModel = modelDrafts[executor.id] ?? executor.model
           const modelChanged = selectedModel !== executor.model
           return <article className={`environment-card ${executor.state}`} key={executor.id}>
@@ -329,7 +429,7 @@ export function ExecutorSettings({ onBack }: { onBack: () => void }) {
             <section className="executor-model"><label htmlFor={`executor-model-${executor.id}`}>运行模型</label><div><select id={`executor-model-${executor.id}`} value={selectedModel} onChange={event => setModelDrafts(current => ({ ...current, [executor.id]: event.target.value }))} disabled={executor.state === 'not_installed'}>{executor.modelOptions.map(option => <option value={option.value} key={option.value || 'default'}>{option.label}</option>)}</select><button className="ghost-btn" onClick={() => void discoverModels(executor)} disabled={!executor.executablePath || busyId === `models:${executor.id}`}>{busyId === `models:${executor.id}` ? '获取中…' : '获取模型'}</button><button className="ghost-btn" onClick={() => void saveModel(executor)} disabled={!modelChanged || busyId === `model:${executor.id}`}>{busyId === `model:${executor.id}` ? '保存中…' : '保存'}</button></div>{executor.modelCatalog ? <small className="executor-model-source" title={executor.modelCatalog.availabilityNote}>已按 {executor.modelCatalog.cliVersion} 刷新 · {executor.modelCatalog.source === 'codex-cli-catalog' ? 'Codex 模型目录' : 'Claude CLI 模型别名'}</small> : <small className="executor-model-source">获取模型后可查看当前 CLI 提供的选项。</small>}</section>
             <footer>
               <span className={`environment-status-text ${executor.state}`}>{stateLabel(executor.state)}</span>
-              {action.kind === 'connect' || action.kind === 'verify' ? <button className="run-btn" onClick={() => void connect(executor)} disabled={actionBusy}><span className="button-glyph" aria-hidden="true">↗</span>{actionBusy ? '检查中…' : action.kind === 'verify' ? '重新检查' : '连接'}</button> : action.kind === 'update' ? <button className="run-btn" onClick={() => setConfirmation({ ids: [executor.id], action: 'update' })} disabled={actionBusy}><span className="button-glyph" aria-hidden="true">↑</span>{actionBusy ? '升级中…' : '升级'}</button> : action.kind === 'install' ? <button className="ghost-btn" onClick={() => setConfirmation({ ids: [executor.id], action: 'install' })} disabled={actionBusy}><span className="button-glyph" aria-hidden="true">⇩</span>安装</button> : <span className="environment-unmanaged">已可调度</span>}
+              {action.kind === 'connect' || action.kind === 'verify' ? <button className="run-btn" onClick={() => void connect(executor)} disabled={actionBusy}><ExternalLink aria-hidden="true" />{actionBusy ? '检查中…' : action.kind === 'verify' ? '重新检查' : '连接'}</button> : action.kind === 'update' ? <button className="run-btn" onClick={() => setConfirmation({ ids: [executor.id], action: 'update' })} disabled={actionBusy}><ArrowUp aria-hidden="true" />{actionBusy ? '升级中…' : '升级'}</button> : action.kind === 'install' ? <button className="ghost-btn" onClick={() => setConfirmation({ ids: [executor.id], action: 'install' })} disabled={actionBusy}><Download aria-hidden="true" />安装</button> : <span className="environment-unmanaged">已可调度</span>}
             </footer>
           </article>
         })}
@@ -346,7 +446,7 @@ export function ExecutorSettings({ onBack }: { onBack: () => void }) {
 
       <details className="executor-manual-commands" open>
         <summary>手动安装命令 <span>仅供复制；Artifact 不会执行这里以外的命令</span></summary>
-        <div><div className="manual-command-heading"><span>受支持的 npm 安装计划</span><button className="ghost-btn" onClick={() => { void navigator.clipboard?.writeText(manualCommands.join('\n\n')); setNotice({ kind: 'success', text: '安装命令已复制。' }) }}><span className="button-glyph" aria-hidden="true">⧉</span>复制</button></div><pre><code>{manualCommands.join('\n\n')}</code></pre></div>
+        <div><div className="manual-command-heading"><span>受支持的 npm 安装计划</span><button className="ghost-btn" onClick={() => { void navigator.clipboard?.writeText(manualCommands.join('\n\n')); setNotice({ kind: 'success', text: '安装命令已复制。' }) }}><Copy aria-hidden="true" />复制</button></div><pre><code>{manualCommands.join('\n\n')}</code></pre></div>
       </details>
     </div>
 

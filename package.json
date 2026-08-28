@@ -50,7 +50,8 @@
     "productName": "Artifact",
     "asar": true,
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "build"
     },
     "files": [
       "dist-electron/**/*"
@@ -66,6 +67,7 @@
       }
     ],
     "mac": {
+      "icon": "icon.png",
       "category": "public.app-category.developer-tools",
       "target": [
         "dir",

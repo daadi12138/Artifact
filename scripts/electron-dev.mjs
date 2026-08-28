@@ -14,6 +14,7 @@ const port = await availablePort()
 const url = `http://127.0.0.1:${port}`
 const environment = {
   ...process.env,
+  ARTIFACT_NEXT_DIST_DIR: '.next-electron-dev',
   ARTIFACT_SERVER_URL: url,
   ARTIFACT_STATE_DIR: stateDirectory,
   ARTIFACT_SESSION_TOKEN: randomUUID(),
@@ -58,13 +59,42 @@ function waitForServer(url, child) {
       if (child.exitCode !== null) { reject(new Error(`Next.js exited with code ${child.exitCode}`)); return }
       try {
         const response = await fetch(url)
-        if (response.ok) { resolveReady(); return }
+        if (response.ok) {
+          const stylesheets = localStylesheets(await response.text(), url)
+          if (stylesheets.length && await stylesheetsAreReady(stylesheets)) { resolveReady(); return }
+        }
       } catch { /* The development server is still starting. */ }
       if (Date.now() - startedAt >= 30_000) { reject(new Error('Next.js did not start within 30 seconds')); return }
       setTimeout(poll, 150)
     }
     void poll()
   })
+}
+
+function localStylesheets(html, pageUrl) {
+  const pageOrigin = new URL(pageUrl).origin
+  const links = html.match(/<link\b[^>]*>/gi) ?? []
+  return links.flatMap(link => {
+    const rel = htmlAttribute(link, 'rel')
+    const href = htmlAttribute(link, 'href')
+    if (!rel?.split(/\s+/).includes('stylesheet') || !href) return []
+    try {
+      const stylesheetUrl = new URL(href, pageUrl)
+      return stylesheetUrl.origin === pageOrigin ? [stylesheetUrl] : []
+    } catch {
+      return []
+    }
+  })
+}
+
+function htmlAttribute(element, name) {
+  const match = element.match(new RegExp(`\\b${name}\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))`, 'i'))
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? null
+}
+
+async function stylesheetsAreReady(stylesheets) {
+  const responses = await Promise.all(stylesheets.map(stylesheet => fetch(stylesheet, { cache: 'no-store' })))
+  return responses.every(response => response.ok && response.headers.get('content-type')?.includes('text/css'))
 }
 
 function availablePort() {

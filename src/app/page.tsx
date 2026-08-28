@@ -1,9 +1,11 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import { AlignHorizontalSpaceAround, Bot, ChevronLeft, ChevronRight, Ellipsis, Focus, FolderCog, History, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Plus, Scan, Settings, Upload, Workflow, X } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import { AlignHorizontalSpaceAround, Bot, Check, ChevronLeft, ChevronRight, Copy, Download, Ellipsis, Eye, Focus, FolderCog, History, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, Upload, Workflow, X } from 'lucide-react'
+import artifactLogo from './assets/artifact-logo.png'
 import { ExecutorSettings, SettingsOverview } from './executor-settings'
-import { RunWorkspace } from './run-workspace'
+import { RunWorkspace, type RunWorkspaceRun } from './run-workspace'
 import { WorkflowLibraryView, type WorkflowRecordView, type WorkflowTemplateView } from './workflow-library'
 
 type NodeState = 'idle' | 'running' | 'paused' | 'success' | 'waiting' | 'failed' | 'cancelled' | 'skipped'
@@ -17,12 +19,15 @@ type Artifact = { id: string; nodeId: string; type: string; version?: number; sc
 type Attempt = { id: string; attempt: number; status: string; startedAt?: string; endedAt?: string; exitReason?: string }
 type PendingCommandApproval = { nodeId: string; commandKey: string; command: CommandSpec; requestedAt: string }
 type Run = { id: string; status: string; startedAt: string; endedAt?: string; worktreePath?: string; branchName?: string; pendingCommandApproval?: PendingCommandApproval; logs: string[]; nodes: Array<{ id: string; state: string; attempts?: Attempt[] }>; artifacts: Artifact[] }
-type DragState = { id: string; dx: number; dy: number; startX: number; startY: number; finalX: number; finalY: number; element: HTMLButtonElement }
+type RunHeaderContext = Pick<RunWorkspaceRun, 'id' | 'status' | 'branchName' | 'workflow'>
+type DragState = { id: string; dx: number; dy: number; startX: number; startY: number; finalX: number; finalY: number; pointerStartX: number; pointerStartY: number; moved: boolean; element: HTMLButtonElement }
 type CanvasViewport = { x: number; y: number; zoom: number }
 type CanvasPanState = { pointerId: number; startX: number; startY: number; originX: number; originY: number }
 type LogPanelResizeState = { pointerId: number; startY: number; startHeight: number }
 type Readiness = { ready: boolean; step: string; title: string; detail: string; action: string; target: 'project' | 'environment' | 'executors' | null }
 type WorkflowMode = 'library' | 'editor'
+type CompactPanel = 'sidebar' | 'inspector' | null
+type InterfaceTheme = 'dark' | 'light'
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null
@@ -101,6 +106,14 @@ function edgePath(from: Pick<WorkflowNode, 'x' | 'y'>, to: Pick<WorkflowNode, 'x
   return `M ${fromX} ${fromY} C ${fromX + 24} ${fromY}, ${toX - 24} ${toY}, ${toX} ${toY}`
 }
 
+function edgeStateClass(from: Pick<WorkflowNode, 'state'>, to: Pick<WorkflowNode, 'state'>) {
+  const states = [from.state, to.state]
+  if (states.some(state => state === 'failed' || state === 'cancelled')) return 'edge-failed'
+  if (states.includes('running')) return 'edge-running'
+  if (states.some(state => state === 'success' || state === 'waiting' || state === 'paused')) return 'edge-active'
+  return ''
+}
+
 function arrangeWorkflowNodes(nodes: WorkflowNode[], edges: Edge[]): WorkflowNode[] {
   if (!nodes.length) return nodes
   const order = new Map(nodes.map((node, index) => [node.id, index]))
@@ -154,7 +167,11 @@ function arrangeWorkflowNodes(nodes: WorkflowNode[], edges: Edge[]): WorkflowNod
 
 export default function HomePage() {
   const [activeView, setActiveView] = useState('settings')
+  const [theme, setTheme] = useState<InterfaceTheme>('dark')
+  const [themeReady, setThemeReady] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [compactLayout, setCompactLayout] = useState(false)
+  const [compactPanel, setCompactPanel] = useState<CompactPanel>(null)
   const [sidebarWidth, setSidebarWidth] = useState(defaultSidebarWidth)
   const [inspectorWidth, setInspectorWidth] = useState(defaultInspectorWidth)
   const [inspectorVisible, setInspectorVisible] = useState(true)
@@ -175,12 +192,16 @@ export default function HomePage() {
   const [running, setRunning] = useState(false)
   const [runId, setRunId] = useState<string | null>(null)
   const [runStatus, setRunStatus] = useState<string | null>(null)
+  const [runHeaderContext, setRunHeaderContext] = useState<RunHeaderContext | null>(null)
   const [pendingCommandApproval, setPendingCommandApproval] = useState<PendingCommandApproval | null>(null)
   const [workflowReady, setWorkflowReady] = useState(false)
   const [logs, setLogs] = useState<string[]>(['工作流已加载 · 核心交付链'])
   const dragRef = useRef<DragState | null>(null)
   const importInputRef = useRef<HTMLInputElement>(null)
   const shellRef = useRef<HTMLDivElement>(null)
+  const sidebarRef = useRef<HTMLElement>(null)
+  const inspectorRef = useRef<HTMLElement>(null)
+  const compactPanelPreviousFocusRef = useRef<HTMLElement | null>(null)
   const sidebarWidthRef = useRef(defaultSidebarWidth)
   const sidebarResizingRef = useRef(false)
   const inspectorWidthRef = useRef(defaultInspectorWidth)
@@ -194,8 +215,30 @@ export default function HomePage() {
   const projectName = project?.name ?? '未导入项目'
 
   useEffect(() => {
+    const savedTheme = window.localStorage.getItem('artifact.theme')
+    const nextTheme: InterfaceTheme = savedTheme === 'light' ? 'light' : 'dark'
+    document.documentElement.dataset.theme = nextTheme
+    document.documentElement.style.colorScheme = nextTheme
+    setTheme(nextTheme)
+    setThemeReady(true)
+  }, [])
+
+  useEffect(() => {
+    if (!themeReady) return
+    window.localStorage.setItem('artifact.theme', theme)
+    document.documentElement.dataset.theme = theme
+    document.documentElement.style.colorScheme = theme
+  }, [theme, themeReady])
+
+  useEffect(() => {
     setSidebarCollapsed(window.localStorage.getItem('artifact.sidebar.collapsed') === 'true')
     setInspectorVisible(window.localStorage.getItem('artifact.inspector.visible') !== 'false')
+    const compactMedia = window.matchMedia('(max-width: 1180px)')
+    const syncCompactLayout = () => {
+      setCompactLayout(compactMedia.matches)
+      if (!compactMedia.matches) setCompactPanel(null)
+    }
+    syncCompactLayout()
     const savedWidth = Number.parseInt(window.localStorage.getItem('artifact.sidebar.width') ?? '', 10)
     if (Number.isFinite(savedWidth)) {
       const width = Math.max(minSidebarWidth, Math.min(maxSidebarWidth, savedWidth))
@@ -211,11 +254,21 @@ export default function HomePage() {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'b' && !isTextEntryTarget(event.target)) {
         event.preventDefault()
-        setSidebarCollapsed(value => !value)
+        if (compactMedia.matches) {
+          setCompactPanel(current => {
+            if (current === 'sidebar') return null
+            compactPanelPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+            return 'sidebar'
+          })
+        } else setSidebarCollapsed(value => !value)
       }
     }
     window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
+    compactMedia.addEventListener('change', syncCompactLayout)
+    return () => {
+      window.removeEventListener('keydown', onKeyDown)
+      compactMedia.removeEventListener('change', syncCompactLayout)
+    }
   }, [])
 
   useEffect(() => {
@@ -225,6 +278,89 @@ export default function HomePage() {
   useEffect(() => {
     window.localStorage.setItem('artifact.inspector.visible', String(inspectorVisible))
   }, [inspectorVisible])
+
+  const closeCompactPanel = () => setCompactPanel(null)
+  const toggleCompactPanel = (panel: Exclude<CompactPanel, null>) => {
+    if (!compactLayout) return false
+    setCompactPanel(current => {
+      if (current === panel) return null
+      compactPanelPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      return panel
+    })
+    return true
+  }
+  const toggleSidebar = () => {
+    if (toggleCompactPanel('sidebar')) return
+    setSidebarCollapsed(value => !value)
+  }
+  const closeSidebar = () => {
+    if (compactLayout) {
+      closeCompactPanel()
+      return
+    }
+    setSidebarCollapsed(true)
+  }
+  const toggleInspector = () => {
+    if (toggleCompactPanel('inspector')) return
+    setInspectorVisible(value => !value)
+  }
+  const openNodeInspector = (nodeId: string) => {
+    setSelectedId(nodeId)
+    if (compactLayout) {
+      compactPanelPreviousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+      setCompactPanel('inspector')
+      return
+    }
+    setInspectorVisible(true)
+  }
+  const trapCompactPanelFocus = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!compactLayout || !compactPanel || event.key !== 'Tab') return
+    const focusable = [...event.currentTarget.querySelectorAll<HTMLElement>('a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')]
+      .filter(element => element.getClientRects().length > 0)
+    if (!focusable.length) {
+      event.preventDefault()
+      return
+    }
+    const first = focusable[0]
+    const last = focusable.at(-1)!
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
+
+  useEffect(() => {
+    if (!compactPanel) return
+    const frame = window.requestAnimationFrame(() => {
+      const panel = compactPanel === 'sidebar' ? sidebarRef.current : inspectorRef.current
+      panel?.querySelector<HTMLElement>('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')?.focus()
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [compactPanel])
+
+  useEffect(() => {
+    if (compactPanel) return
+    const previousFocus = compactPanelPreviousFocusRef.current
+    if (!previousFocus) return
+    compactPanelPreviousFocusRef.current = null
+    const frame = window.requestAnimationFrame(() => previousFocus.focus())
+    return () => window.cancelAnimationFrame(frame)
+  }, [compactPanel])
+
+  useEffect(() => {
+    if (!compactPanel) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeCompactPanel()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [compactPanel])
 
   const updateSidebarWidth = (value: number, persist = true) => {
     const width = Math.max(minSidebarWidth, Math.min(maxSidebarWidth, value))
@@ -246,7 +382,7 @@ export default function HomePage() {
 
   const resizeSidebar = (event: React.PointerEvent<HTMLButtonElement>) => {
     if (!sidebarResizingRef.current) return
-    updateSidebarWidth(event.clientX - 58, false)
+    updateSidebarWidth(event.clientX - 52, false)
   }
 
   const finishSidebarResize = (event: React.PointerEvent<HTMLButtonElement>) => {
@@ -351,6 +487,7 @@ export default function HomePage() {
     setSelectedId(nextNodes[0]?.id ?? initialNodes[0].id)
     setRunId(null)
     setRunStatus(null)
+    setRunHeaderContext(null)
     setPendingCommandApproval(null)
     setRunning(false)
     setLogs([`工作流已加载 · ${workflow.draft.name}`])
@@ -444,6 +581,7 @@ export default function HomePage() {
   const syncRun = useCallback((run: Run, focusNodeId?: string) => {
     setRunId(run.id)
     setRunStatus(run.status)
+    setRunHeaderContext(current => current?.id === run.id ? { ...current, status: run.status, branchName: run.branchName } : current)
     setPendingCommandApproval(run.pendingCommandApproval ?? null)
     setLogs(run.logs)
     setRunning(['running', 'preparing', 'awaiting_approval'].includes(run.status))
@@ -477,16 +615,19 @@ export default function HomePage() {
     if (!target) return
     setActiveView('settings')
     setSettingsPage(target === 'executors' ? 'executors' : 'overview')
+    if (compactLayout) closeCompactPanel()
   }
   const selectView = (view: string) => {
     setActiveView(view)
-    setSidebarCollapsed(false)
+    if (compactLayout) closeCompactPanel()
+    else setSidebarCollapsed(false)
     if (view !== 'settings') setSettingsPage('overview')
     if (view === 'workflow') setWorkflowMode('library')
   }
   const openWorkflowLibrary = () => {
     setActiveView('workflow')
     setWorkflowMode('library')
+    if (compactLayout) closeCompactPanel()
   }
   const openWorkflowEditor = (workflow: WorkflowRecordView) => {
     applyWorkflowRecord(workflow)
@@ -595,20 +736,29 @@ export default function HomePage() {
   const incomingNodes = selected ? edges.filter(edge => edge.to === selected.id).map(edge => nodes.find(node => node.id === edge.from)).filter((node): node is WorkflowNode => Boolean(node)) : []
   const primaryInputId = incomingNodes[0]?.id ?? ''
   const configurableExecutors = executorOptions
-  const hasInspector = activeView === 'workflow' && workflowMode === 'editor' && inspectorVisible
+  const workflowInspectorAvailable = activeView === 'workflow' && workflowMode === 'editor'
+  const activeCompactPanel = compactLayout && (compactPanel === 'sidebar' || (compactPanel === 'inspector' && workflowInspectorAvailable)) ? compactPanel : null
+  const hasInspector = workflowInspectorAvailable && (compactLayout ? activeCompactPanel === 'inspector' : inspectorVisible)
   const activeNavItem = navItems.find(item => item.id === activeView)
   const selectedCommandApproval = pendingCommandApproval?.nodeId === selected?.id ? pendingCommandApproval : null
+  const runContextVisible = activeView === 'runs'
+  const headerRunStatus = runContextVisible ? (runHeaderContext?.status ?? runStatus) : runStatus
+  const headerWorkflowName = runContextVisible
+    ? runHeaderContext?.workflow?.workflowName
+    : activeView === 'workflow' && workflowMode === 'editor' ? selectedWorkflow?.draft.name : undefined
+  const headerBranchName = runContextVisible ? runHeaderContext?.branchName : undefined
 
-  return <div ref={shellRef} className={`app-shell view-${activeView} workflow-${workflowMode} ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${hasInspector ? 'has-inspector' : ''}`} style={{ '--primary-sidebar-width': `${sidebarWidth}px`, '--inspector-width': `${inspectorWidth}px` } as CSSProperties}>
+  return <div ref={shellRef} className={`app-shell theme-${theme} view-${activeView} workflow-${workflowMode} ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${compactLayout ? 'compact-layout' : ''} ${activeCompactPanel ? `compact-panel-${activeCompactPanel}` : ''} ${hasInspector ? 'has-inspector' : ''}`} style={{ '--primary-sidebar-width': `${sidebarWidth}px`, '--inspector-width': `${inspectorWidth}px` } as CSSProperties}>
     <aside className="activity-bar" aria-label="主导航">
-      <div className="activity-brand"><span className="brand-mark">A</span></div>
+      <div className="activity-brand"><img className="brand-mark" src={artifactLogo.src} width={30} height={30} alt="Artifact" draggable={false} /></div>
       <nav className="activity-nav">
         {navItems.map(item => { const Icon = item.icon; return <button key={item.id} title={item.label} aria-label={item.label} aria-current={activeView === item.id ? 'page' : undefined} className={activeView === item.id ? 'activity-item active' : 'activity-item'} onClick={() => selectView(item.id)}><Icon aria-hidden="true" /></button> })}
       </nav>
-      <div className="activity-bottom"><button className="activity-item" title="收起或展开侧栏" aria-label="收起或展开侧栏" onClick={() => setSidebarCollapsed(value => !value)}>{sidebarCollapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}</button></div>
+      <div className="activity-bottom"><button className="activity-item" title="收起或展开侧栏" aria-label="收起或展开侧栏" aria-expanded={compactLayout ? activeCompactPanel === 'sidebar' : !sidebarCollapsed} onClick={toggleSidebar}>{compactLayout ? activeCompactPanel === 'sidebar' ? <PanelLeftClose aria-hidden="true" /> : <PanelLeftOpen aria-hidden="true" /> : sidebarCollapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}</button></div>
     </aside>
-    <aside className="sidebar" aria-label={`${activeNavItem?.label ?? '工作区'}侧栏`}>
-      <div className="side-brand"><span className="brand-name">artifact</span><span className="beta">ALPHA</span><button className="sidebar-toggle" onClick={() => setSidebarCollapsed(true)} aria-label="收起侧栏" title="收起侧栏 (⌘B)"><PanelLeftClose aria-hidden="true" /></button></div>
+    {activeCompactPanel && <button className="compact-panel-backdrop" type="button" aria-label="关闭侧栏或节点检查器" onClick={closeCompactPanel} />}
+    <aside ref={sidebarRef} className="sidebar" aria-label={`${activeNavItem?.label ?? '工作区'}侧栏`} aria-hidden={compactLayout && activeCompactPanel !== 'sidebar'} role={activeCompactPanel === 'sidebar' ? 'dialog' : undefined} aria-modal={activeCompactPanel === 'sidebar' ? true : undefined} onKeyDown={trapCompactPanelFocus}>
+      <div className="side-brand"><span className="brand-name">artifact</span><span className="beta">ALPHA</span><button className="sidebar-toggle" onClick={closeSidebar} aria-label="收起侧栏" title="收起侧栏 (⌘B)"><PanelLeftClose aria-hidden="true" /></button></div>
       <button className="project-switcher" onClick={() => openSetup(project ? 'environment' : 'project')} aria-label={project ? `切换或查看项目 ${project.name}` : '选择项目'}><span className="project-avatar">{project ? project.name.slice(0, 1).toUpperCase() : <Plus aria-hidden="true" />}</span><span><b>{projectName}</b><small>{project ? '命令按需授权' : '选择本地 Git 项目'}</small></span><ChevronRight className="chevron" aria-hidden="true" /></button>
       <div className="side-label">{activeNavItem?.label ?? '工作区'}</div>
       <div className="sidebar-context">
@@ -622,14 +772,14 @@ export default function HomePage() {
     </aside>
     <button className="sidebar-resizer" type="button" role="separator" aria-label="调整主侧栏宽度" aria-orientation="vertical" aria-valuemin={minSidebarWidth} aria-valuemax={maxSidebarWidth} aria-valuenow={sidebarWidth} tabIndex={sidebarCollapsed ? -1 : 0} onPointerDown={startSidebarResize} onPointerMove={resizeSidebar} onPointerUp={finishSidebarResize} onPointerCancel={finishSidebarResize} onKeyDown={adjustSidebarWidth} onDoubleClick={() => updateSidebarWidth(defaultSidebarWidth)} />
     <main className="workspace">
-      <header className="workspace-header"><div className="header-leading"><div className="breadcrumb"><span>{projectName}</span><i>/</i><b>{activeNavItem?.label}</b>{activeView === 'workflow' && workflowMode === 'editor' && selectedWorkflow && <><i>/</i><b>{selectedWorkflow.draft.name}</b></>}</div></div>{activeView === 'workflow' && workflowMode === 'editor' && <span className={`saved ${draftSaveState}`}><i />{draftSaveState === 'saving' ? '保存中' : draftSaveState === 'error' ? '保存失败' : '已保存'}</span>}<input ref={importInputRef} type="file" accept="application/json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importWorkflow(file); event.currentTarget.value = '' }} /></header>
-      {activeView === 'workflow' && workflowMode === 'library' ? <WorkflowLibraryView workflows={workflows} templates={templates} busyId={workflowBusyId} onCreate={template => void createWorkflow(template)} onEdit={openWorkflowEditor} onPublish={workflow => void publishWorkflow(workflow)} onLaunch={() => selectView('runs')} /> : activeView === 'workflow' ? <WorkflowView workflowName={selectedWorkflow?.draft.name ?? '工作流'} publishedRevision={selectedWorkflow?.published.at(-1)?.revision} saveState={draftSaveState} nodes={nodes} edges={edges} selectedId={selectedId} logs={logs} workflowReady={workflowReady && Boolean(selectedWorkflowId)} inspectorVisible={hasInspector} dragRef={dragRef} onSelect={setSelectedId} onMove={setNodes} onConnect={connectSelectedTo} onAddNode={addNode} onArrange={arrangeWorkflow} onImport={() => importInputRef.current?.click()} onExport={exportWorkflow} onToggleInspector={() => setInspectorVisible(value => !value)} onBack={openWorkflowLibrary} onPublish={publishSelectedWorkflow} publishing={workflowBusyId === `publish:${selectedWorkflowId}`} /> : activeView === 'runs' ? <RunWorkspace workflows={workflows} onEditWorkflow={openWorkflowEditor} /> : activeView === 'artifacts' ? <ArtifactView /> : settingsPage === 'executors' ? <ExecutorSettings onBack={() => setSettingsPage('overview')} /> : <SettingsOverview onExecutors={() => setSettingsPage('executors')} onOpenWorkflow={openWorkflowLibrary} executorConfigured={executorOptions.some(executor => executor.connected)} />}
+      <header className="workspace-header"><div className="header-leading"><div className="breadcrumb"><span>{projectName}</span><i>/</i><b>{activeNavItem?.label}</b>{headerWorkflowName && <><i>/</i><b title={headerWorkflowName}>{headerWorkflowName}</b></>}{headerBranchName && <><i>/</i><code title={headerBranchName}>{headerBranchName}</code></>}</div></div><div className="header-actions">{activeView === 'workflow' && workflowMode === 'editor' && <span className={`saved ${draftSaveState}`}><i />{draftSaveState === 'saving' ? '保存中' : draftSaveState === 'error' ? '保存失败' : '已保存'}</span>}<span className={`header-runtime-badge ${headerRunStatus ?? 'ready'}`} title={headerRunStatus ? `当前运行：${runStatusLabel(headerRunStatus)}` : '本地运行时就绪'}><i />{headerRunStatus ? runStatusLabel(headerRunStatus) : '运行时就绪'}</span><button className="run-btn header-run-trigger" type="button" onClick={() => selectView('runs')} aria-current={activeView === 'runs' ? 'page' : undefined}><Play aria-hidden="true" />运行</button></div><input ref={importInputRef} type="file" accept="application/json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importWorkflow(file); event.currentTarget.value = '' }} /></header>
+      {activeView === 'workflow' && workflowMode === 'library' ? <WorkflowLibraryView workflows={workflows} templates={templates} busyId={workflowBusyId} onCreate={template => void createWorkflow(template)} onEdit={openWorkflowEditor} onPublish={workflow => void publishWorkflow(workflow)} onLaunch={() => selectView('runs')} /> : activeView === 'workflow' ? <WorkflowView workflowName={selectedWorkflow?.draft.name ?? '工作流'} publishedRevision={selectedWorkflow?.published.at(-1)?.revision} saveState={draftSaveState} nodes={nodes} edges={edges} selectedId={selectedId} logs={logs} workflowReady={workflowReady && Boolean(selectedWorkflowId)} compactLayout={compactLayout} inspectorVisible={hasInspector} dragRef={dragRef} onSelect={setSelectedId} onInspect={openNodeInspector} onMove={setNodes} onConnect={connectSelectedTo} onAddNode={addNode} onArrange={arrangeWorkflow} onImport={() => importInputRef.current?.click()} onExport={exportWorkflow} onToggleInspector={toggleInspector} onBack={openWorkflowLibrary} onPublish={publishSelectedWorkflow} publishing={workflowBusyId === `publish:${selectedWorkflowId}`} /> : activeView === 'runs' ? <RunWorkspace workflows={workflows} onEditWorkflow={openWorkflowEditor} onRunContextChange={setRunHeaderContext} /> : activeView === 'artifacts' ? <ArtifactView /> : settingsPage === 'executors' ? <ExecutorSettings onBack={() => setSettingsPage('overview')} /> : <SettingsOverview onExecutors={() => setSettingsPage('executors')} onOpenWorkflow={openWorkflowLibrary} executorConfigured={executorOptions.some(executor => executor.connected)} theme={theme} onThemeChange={setTheme} />}
       <footer className="status-bar"><div className="status-group"><span className="status-item project-status"><i />{projectName}</span><span className="status-item">{runStatus ? runStatusLabel(runStatus) : '就绪'}</span></div><div className="status-group"><span className="status-item">本地运行时</span><span className="status-item">Artifact 0.1.0</span></div></footer>
     </main>
     {hasInspector && <>
       <button className="inspector-resizer" type="button" role="separator" aria-label="调整节点编辑器宽度" aria-orientation="vertical" aria-valuemin={minInspectorWidth} aria-valuemax={maxInspectorWidth} aria-valuenow={inspectorWidth} tabIndex={0} onPointerDown={startInspectorResize} onPointerMove={resizeInspector} onPointerUp={finishInspectorResize} onPointerCancel={finishInspectorResize} onKeyDown={adjustInspectorWidth} onDoubleClick={() => updateInspectorWidth(defaultInspectorWidth)} />
-      <aside className="inspector">
-        <div className="inspector-head"><div><span className={`inspector-icon ${selected?.tone ?? ''}`}>{selected?.kind === 'Agent' ? <Bot aria-hidden="true" /> : selected?.kind === '审批' ? <Scan aria-hidden="true" /> : <Package aria-hidden="true" />}</span><div><h2>{selected?.title ?? '未选择节点'}</h2><p>{selected?.subtitle ?? '从画布选择一个节点'}</p></div></div><button className="inspector-close" aria-label="隐藏检查器" title="隐藏检查器" onClick={() => setInspectorVisible(false)}><X aria-hidden="true" /></button></div>
+      <aside ref={inspectorRef} className="inspector" role={activeCompactPanel === 'inspector' ? 'dialog' : undefined} aria-modal={activeCompactPanel === 'inspector' ? true : undefined} onKeyDown={trapCompactPanelFocus}>
+        <div className="inspector-head"><div><span className={`inspector-icon ${selected?.tone ?? ''}`}>{selected?.kind === 'Agent' ? <Bot aria-hidden="true" /> : selected?.kind === '审批' ? <Scan aria-hidden="true" /> : <Package aria-hidden="true" />}</span><div><h2>{selected?.title ?? '未选择节点'}</h2><p>{selected?.subtitle ?? '从画布选择一个节点'}</p></div></div><button className="inspector-close" aria-label="隐藏检查器" title="隐藏检查器" onClick={toggleInspector}><X aria-hidden="true" /></button></div>
         {selected && <>
           <div className="inspector-body">
             <div className="inspector-section-label">基本信息</div>
@@ -649,7 +799,7 @@ export default function HomePage() {
   </div>
 }
 
-function WorkflowView(props: { workflowName: string; publishedRevision?: number; saveState: 'saved' | 'saving' | 'error'; publishing: boolean; nodes: WorkflowNode[]; edges: Edge[]; selectedId: string; logs: string[]; workflowReady: boolean; inspectorVisible: boolean; dragRef: React.MutableRefObject<DragState | null>; onSelect: (id: string) => void; onMove: React.Dispatch<React.SetStateAction<WorkflowNode[]>>; onConnect: (id: string) => void; onAddNode: (preset: typeof nodePresets[number]) => void; onArrange: () => WorkflowNode[]; onImport: () => void; onExport: () => void; onToggleInspector: () => void; onBack: () => void; onPublish: () => void }) {
+function WorkflowView(props: { workflowName: string; publishedRevision?: number; saveState: 'saved' | 'saving' | 'error'; publishing: boolean; nodes: WorkflowNode[]; edges: Edge[]; selectedId: string; logs: string[]; workflowReady: boolean; compactLayout: boolean; inspectorVisible: boolean; dragRef: React.MutableRefObject<DragState | null>; onSelect: (id: string) => void; onInspect: (id: string) => void; onMove: React.Dispatch<React.SetStateAction<WorkflowNode[]>>; onConnect: (id: string) => void; onAddNode: (preset: typeof nodePresets[number]) => void; onArrange: () => WorkflowNode[]; onImport: () => void; onExport: () => void; onToggleInspector: () => void; onBack: () => void; onPublish: () => void }) {
   const [viewport, setViewport] = useState<CanvasViewport>({ x: 0, y: 0, zoom: 1 })
   const [viewportMoving, setViewportMoving] = useState(true)
   const [panning, setPanning] = useState(false)
@@ -662,12 +812,15 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
   const [logPanelResizing, setLogPanelResizing] = useState(false)
   const canvasRef = useRef<HTMLElement>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
+  const commandDockRef = useRef<HTMLDivElement>(null)
   const edgePathRefs = useRef(new Map<string, SVGPathElement>())
   const viewportRef = useRef<CanvasViewport>(viewport)
   const panRef = useRef<CanvasPanState | null>(null)
   const spacePanRef = useRef(false)
   const viewportTimerRef = useRef<number | null>(null)
   const initialFitDoneRef = useRef(false)
+  const suppressNodeClickRef = useRef(false)
+  const compactLayoutRef = useRef(props.compactLayout)
   const logPanelHeightRef = useRef(defaultLogPanelHeight)
   const logPanelResizeRef = useRef<LogPanelResizeState | null>(null)
 
@@ -767,6 +920,10 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
     }
     const drag = props.dragRef.current
     if (!drag) return
+    if (!drag.moved) {
+      if (Math.hypot(event.clientX - drag.pointerStartX, event.clientY - drag.pointerStartY) < 4) return
+      drag.moved = true
+    }
     const canvas = event.currentTarget.getBoundingClientRect()
     const current = viewportRef.current
     const nextX = Math.max(14, (event.clientX - canvas.left - current.x) / current.zoom - drag.dx)
@@ -780,10 +937,23 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
     const drag = props.dragRef.current
     if (!drag) return
     if (event && drag.element.hasPointerCapture(event.pointerId)) drag.element.releasePointerCapture(event.pointerId)
+    const moved = drag.moved
     drag.element.style.transform = ''
     drag.element.classList.remove('dragging')
-    if (drag.startX !== drag.finalX || drag.startY !== drag.finalY) props.onMove(current => current.map(node => node.id === drag.id ? { ...node, x: drag.finalX, y: drag.finalY } : node))
+    if (moved) props.onMove(current => current.map(node => node.id === drag.id ? { ...node, x: drag.finalX, y: drag.finalY } : node))
+    const pointerReleased = event?.type === 'pointerup'
+    suppressNodeClickRef.current = pointerReleased
+    if (pointerReleased && !moved) props.onInspect(drag.id)
+    if (suppressNodeClickRef.current) window.setTimeout(() => { suppressNodeClickRef.current = false }, 0)
     props.dragRef.current = null
+  }
+
+  const inspectNode = (nodeId: string) => {
+    if (suppressNodeClickRef.current) {
+      suppressNodeClickRef.current = false
+      return
+    }
+    props.onInspect(nodeId)
   }
 
   const finishPointer = (event?: React.PointerEvent<HTMLElement>) => {
@@ -825,7 +995,7 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
   useEffect(() => {
     if (!showLibrary && !showWorkflowMenu && !showShortcuts) return
     const closeOnOutsidePointer = (event: PointerEvent) => {
-      if (event.target instanceof Node && !toolbarRef.current?.contains(event.target)) {
+      if (event.target instanceof Node && !toolbarRef.current?.contains(event.target) && !commandDockRef.current?.contains(event.target)) {
         setShowLibrary(false)
         setShowWorkflowMenu(false)
         setShowShortcuts(false)
@@ -885,6 +1055,13 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
     return () => window.cancelAnimationFrame(frame)
   }, [fitView, props.nodes.length])
 
+  useEffect(() => {
+    if (compactLayoutRef.current === props.compactLayout) return
+    compactLayoutRef.current = props.compactLayout
+    const frame = window.requestAnimationFrame(() => fitView())
+    return () => window.cancelAnimationFrame(frame)
+  }, [fitView, props.compactLayout])
+
   useEffect(() => () => { if (viewportTimerRef.current !== null) window.clearTimeout(viewportTimerRef.current) }, [])
 
   useEffect(() => {
@@ -919,51 +1096,116 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
   const viewportTransform = `translate3d(${viewport.x}px, ${viewport.y}px, 0) scale(${viewport.zoom})`
 
   return <>
-    <section className={`workflow-readiness ${props.saveState === 'error' ? 'needs-action' : 'ready'}`}>
-      <div><span>工作流草稿</span><strong>{props.saveState === 'saving' ? '正在保存更改' : props.saveState === 'error' ? '保存需要重试' : '编辑器已准备就绪'}</strong><p>发布后会生成不可变版本；运行工作台只允许使用已发布版本。</p></div>
-      <div className="workflow-readiness-actions"><button className="ghost-btn" onClick={props.onBack}>返回工作流库</button></div>
-    </section>
     <div ref={toolbarRef} className="canvas-toolbar workflow-toolbar">
       <div className="workflow-toolbar-title"><button className="header-icon-button workflow-back-button" onClick={props.onBack} aria-label="返回工作流库" title="返回工作流库"><ChevronLeft aria-hidden="true" /></button><span className="flow-icon"><Workflow aria-hidden="true" /></span><div><b>{props.workflowName}</b><small>{props.publishedRevision ? `已发布 v${props.publishedRevision}` : '草稿'} · {props.nodes.length} 个节点 · {props.edges.length} 条连接</small></div><span className={`draft-save-indicator ${props.saveState}`} aria-live="polite">{props.saveState === 'saving' ? '保存中' : props.saveState === 'error' ? '保存失败' : '已保存'}</span></div>
       <div className="toolbar-group workflow-actions">
-        <div className="toolbar-menu"><button className="toolbar-primary-action" onClick={toggleLibrary} aria-haspopup="menu" aria-expanded={showLibrary}><Plus aria-hidden="true" /><span>添加节点</span></button>{showLibrary && <div className="node-library" role="menu" aria-label="节点库">{nodePresets.map(preset => <button key={preset.title} role="menuitem" onClick={() => addNode(preset)}><span className={`library-dot ${preset.tone}`} /><span><b>{preset.title}</b><small>{preset.subtitle}</small></span><Plus aria-hidden="true" /></button>)}</div>}</div>
         <div className="toolbar-utility-group" aria-label="画布与面板工具">
-          <button className="header-icon-button arrange-button" onClick={arrangeNodes} aria-label="一键整理流水线" title="一键整理流水线"><AlignHorizontalSpaceAround aria-hidden="true" /></button>
           <button className="header-icon-button canvas-command" onClick={() => fitView(true)} aria-label="居中显示全部节点" title="居中显示全部节点 (0)"><Scan aria-hidden="true" /></button>
           <button className="header-icon-button canvas-command" onClick={() => focusSelected(true)} aria-label="聚焦选中节点" title="聚焦选中节点 (F)" disabled={!props.selectedId}><Focus aria-hidden="true" /></button>
           <span className="toolbar-separator" aria-hidden="true" />
           <button className={`header-icon-button log-panel-toggle ${logPanelVisible ? 'active' : ''}`} onClick={() => setLogPanelVisible(value => !value)} aria-label={logPanelVisible ? '收起编辑活动' : '显示编辑活动'} title={logPanelVisible ? '收起编辑活动' : '显示编辑活动'}><PanelBottom aria-hidden="true" /></button>
           <button className={`header-icon-button inspector-toggle ${props.inspectorVisible ? 'active' : ''}`} onClick={props.onToggleInspector} aria-label={props.inspectorVisible ? '隐藏节点检查器' : '显示节点检查器'} title={props.inspectorVisible ? '隐藏节点检查器' : '显示节点检查器'}><PanelRight aria-hidden="true" /></button>
-        <div className="toolbar-menu"><button className="header-icon-button" onClick={toggleWorkflowMenu} aria-haspopup="menu" aria-expanded={showWorkflowMenu} aria-label="工作流更多操作" title="工作流更多操作"><Ellipsis aria-hidden="true" /></button>{showWorkflowMenu && <div className="workflow-menu" role="menu" aria-label="工作流操作"><button role="menuitem" onClick={() => { setShowWorkflowMenu(false); props.onImport() }}>导入工作流</button><button role="menuitem" onClick={() => { setShowWorkflowMenu(false); props.onExport() }}>导出工作流</button><button role="menuitem" onClick={() => { setShowWorkflowMenu(false); setShowShortcuts(true) }}>快捷键</button></div>}{showShortcuts && <div className="shortcut-popover" role="dialog" aria-label="流程编辑快捷键"><div><b>画布快捷键</b><button onClick={() => setShowShortcuts(false)} aria-label="关闭快捷键"><X aria-hidden="true" /></button></div><p><kbd>0</kbd><span>居中显示全部节点</span></p><p><kbd>1</kbd><span>恢复为 100% 缩放</span></p><p><kbd>F</kbd><span>聚焦选中节点</span></p><p><kbd>Space</kbd><span>按住后拖拽平移</span></p><p><kbd>⌘/Ctrl</kbd><kbd>Enter</kbd><span>发布当前草稿</span></p><p><kbd>⌘/Ctrl</kbd><kbd>B</kbd><span>收起或展开侧栏</span></p></div>}</div>
+          <div className="toolbar-menu"><button className="header-icon-button" onClick={toggleWorkflowMenu} aria-haspopup="menu" aria-expanded={showWorkflowMenu} aria-label="工作流更多操作" title="工作流更多操作"><Ellipsis aria-hidden="true" /></button>{showWorkflowMenu && <div className="workflow-menu" role="menu" aria-label="工作流操作"><button role="menuitem" onClick={() => { setShowWorkflowMenu(false); setShowShortcuts(true) }}>快捷键</button></div>}{showShortcuts && <div className="shortcut-popover" role="dialog" aria-label="流程编辑快捷键"><div><b>画布快捷键</b><button onClick={() => setShowShortcuts(false)} aria-label="关闭快捷键"><X aria-hidden="true" /></button></div><p><kbd>0</kbd><span>居中显示全部节点</span></p><p><kbd>1</kbd><span>恢复为 100% 缩放</span></p><p><kbd>F</kbd><span>聚焦选中节点</span></p><p><kbd>Space</kbd><span>按住后拖拽平移</span></p><p><kbd>⌘/Ctrl</kbd><kbd>Enter</kbd><span>发布当前草稿</span></p><p><kbd>⌘/Ctrl</kbd><kbd>B</kbd><span>收起或展开侧栏</span></p></div>}</div>
         </div><button className="run-btn" onClick={props.onPublish} disabled={props.publishing || !props.workflowReady}><Upload aria-hidden="true" />{runLabel}</button>
       </div>
     </div>
     <section ref={canvasRef} className={`canvas-area ${panning ? 'panning' : ''} ${spacePressed ? 'pan-ready' : ''}`} data-viewport-moving={viewportMoving} onPointerDown={startPan} onPointerMove={move} onPointerUp={finishPointer} onPointerCancel={finishPointer} onWheel={zoomCanvas}>
       <div className="canvas-grid" />
-      <div className="flow-canvas" style={{ transform: viewportTransform }}><svg className="edges" viewBox={`0 0 ${flowWidth} ${flowHeight}`} preserveAspectRatio="none">{props.edges.map(edge => { const from = props.nodes.find(node => node.id === edge.from); const to = props.nodes.find(node => node.id === edge.to); const key = `${edge.from}-${edge.to}`; return from && to ? <path key={key} ref={element => { if (element) edgePathRefs.current.set(key, element); else edgePathRefs.current.delete(key) }} d={edgePath(from, to)} /> : null })}</svg>{props.nodes.map(node => <button key={node.id} className={`flow-node ${node.tone} ${props.selectedId === node.id ? 'selected' : ''}`} style={{ left: node.x, top: node.y }} onClick={() => props.onSelect(node.id)} onPointerDown={event => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); if (event.shiftKey) { props.onConnect(node.id); props.onSelect(node.id); return }; const canvas = canvasRef.current?.getBoundingClientRect(); if (!canvas) return; const current = viewportRef.current; const pointerX = (event.clientX - canvas.left - current.x) / current.zoom; const pointerY = (event.clientY - canvas.top - current.y) / current.zoom; const element = event.currentTarget; props.dragRef.current = { id: node.id, dx: pointerX - node.x, dy: pointerY - node.y, startX: node.x, startY: node.y, finalX: node.x, finalY: node.y, element }; element.classList.add('dragging'); element.setPointerCapture(event.pointerId); props.onSelect(node.id) }}><span className="node-kind">{node.kind}</span><span className="node-title">{node.title}</span><span className="node-subtitle">{node.subtitle}</span><span className={`node-status ${node.state}`}><i />{stateLabel(node.state)}</span><span className="node-output">{node.output}<b>›</b></span></button>)}</div>
+      <div className="flow-canvas" style={{ transform: viewportTransform }}><svg className="edges" viewBox={`0 0 ${flowWidth} ${flowHeight}`} preserveAspectRatio="none">{props.edges.map(edge => { const from = props.nodes.find(node => node.id === edge.from); const to = props.nodes.find(node => node.id === edge.to); const key = `${edge.from}-${edge.to}`; return from && to ? <path key={key} className={edgeStateClass(from, to)} ref={element => { if (element) edgePathRefs.current.set(key, element); else edgePathRefs.current.delete(key) }} d={edgePath(from, to)} /> : null })}</svg>{props.nodes.map(node => <button key={node.id} className={`flow-node ${node.tone} ${node.state} ${props.selectedId === node.id ? 'selected' : ''}`} style={{ left: node.x, top: node.y }} onClick={event => { if (!event.shiftKey) inspectNode(node.id) }} onPointerDown={event => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); if (event.shiftKey) { props.onConnect(node.id); props.onSelect(node.id); return }; const canvas = canvasRef.current?.getBoundingClientRect(); if (!canvas) return; const current = viewportRef.current; const pointerX = (event.clientX - canvas.left - current.x) / current.zoom; const pointerY = (event.clientY - canvas.top - current.y) / current.zoom; const element = event.currentTarget; props.dragRef.current = { id: node.id, dx: pointerX - node.x, dy: pointerY - node.y, startX: node.x, startY: node.y, finalX: node.x, finalY: node.y, pointerStartX: event.clientX, pointerStartY: event.clientY, moved: false, element }; element.classList.add('dragging'); element.setPointerCapture(event.pointerId); props.onSelect(node.id) }}><span className="node-kind">{node.kind}</span><span className="node-title">{node.title}</span><span className="node-subtitle">{node.subtitle}</span><span className={`node-status ${node.state}`}><i />{stateLabel(node.state)}</span><span className="node-output">{node.output}<b>›</b></span></button>)}</div>
       <div className="canvas-hint">拖拽移动节点 · 空格+拖拽或中键平移 · ⌘/Ctrl+滚轮缩放 · Shift+点击目标节点连线</div>
       <div className="canvas-zoom" aria-label={`当前缩放 ${Math.round(viewport.zoom * 100)}%`}>{Math.round(viewport.zoom * 100)}%</div>
+      <div ref={commandDockRef} className="canvas-command-dock" role="toolbar" aria-label="工作流命令" onPointerDown={event => event.stopPropagation()}>
+        <div className="toolbar-menu canvas-dock-menu"><button className="canvas-dock-primary" type="button" onClick={toggleLibrary} aria-haspopup="menu" aria-expanded={showLibrary} title="添加节点"><Plus aria-hidden="true" /><span>添加节点</span></button>{showLibrary && <div className="node-library" role="menu" aria-label="节点库">{nodePresets.map(preset => <button key={preset.title} role="menuitem" onClick={() => addNode(preset)}><span className={`library-dot ${preset.tone}`} /><span><b>{preset.title}</b><small>{preset.subtitle}</small></span><Plus aria-hidden="true" /></button>)}</div>}</div>
+        <button className="canvas-dock-button" type="button" onClick={arrangeNodes} title="自动排版"><AlignHorizontalSpaceAround aria-hidden="true" /><span>自动排版</span></button>
+        <span className="canvas-dock-separator" aria-hidden="true" />
+        <button className="canvas-dock-button" type="button" onClick={props.onImport} title="导入工作流"><Upload aria-hidden="true" /><span>导入</span></button>
+        <button className="canvas-dock-button" type="button" onClick={props.onExport} title="导出工作流"><Download aria-hidden="true" /><span>导出</span></button>
+      </div>
     </section>
-    {logPanelVisible && <section className={`bottom-panel ${logPanelResizing ? 'resizing' : ''}`} style={{ '--log-panel-height': `${logPanelHeight}px` } as CSSProperties}><button className="log-panel-resizer" type="button" role="separator" aria-label="调整编辑活动高度" aria-orientation="horizontal" aria-valuemin={minLogPanelHeight} aria-valuemax={maxLogPanelHeight} aria-valuenow={logPanelHeight} title="拖动调整编辑活动高度；双击恢复默认" tabIndex={0} onPointerDown={startLogPanelResize} onPointerMove={resizeLogPanel} onPointerUp={finishLogPanelResize} onPointerCancel={finishLogPanelResize} onKeyDown={adjustLogPanelHeight} onDoubleClick={() => updateLogPanelHeight(defaultLogPanelHeight)} /><div className="panel-tabs"><span className="panel-tab active">编辑活动 <span>{props.logs.length}</span></span><button className="log-panel-close" type="button" onClick={() => setLogPanelVisible(false)} aria-label="收起编辑活动" title="收起编辑活动"><X aria-hidden="true" /></button></div><div className="log-content"><div className="logs">{props.logs.slice(0, 8).map((log, index) => <div className="log-line" key={`${log}-${index}`}><span className={index === 0 ? 'log-dot active' : 'log-dot'} />{log}</div>)}</div><div className="run-summary"><div><span className="summary-label">草稿状态</span><strong>{props.saveState === 'saving' ? '保存中' : props.saveState === 'error' ? '保存失败' : '已保存'}</strong></div><div><span className="summary-label">节点</span><strong>{props.nodes.length}</strong></div><div><span className="summary-label">发布版本</span><strong className="mono">{props.publishedRevision ? `v${props.publishedRevision}` : '未发布'}</strong></div></div></div></section>}
+    {logPanelVisible && <section className={`bottom-panel ${logPanelResizing ? 'resizing' : ''}`} style={{ '--log-panel-height': `${logPanelHeight}px` } as CSSProperties}><button className="log-panel-resizer" type="button" role="separator" aria-label="调整编辑活动高度" aria-orientation="horizontal" aria-valuemin={minLogPanelHeight} aria-valuemax={maxLogPanelHeight} aria-valuenow={logPanelHeight} title="拖动调整编辑活动高度；双击恢复默认" tabIndex={0} onPointerDown={startLogPanelResize} onPointerMove={resizeLogPanel} onPointerUp={finishLogPanelResize} onPointerCancel={finishLogPanelResize} onKeyDown={adjustLogPanelHeight} onDoubleClick={() => updateLogPanelHeight(defaultLogPanelHeight)} /><div className="panel-tabs"><span className="panel-tab active">编辑活动 <span>{props.logs.length}</span></span><button className="log-panel-close" type="button" onClick={() => setLogPanelVisible(false)} aria-label="收起编辑活动" title="收起编辑活动"><X aria-hidden="true" /></button></div><div className="log-content"><div className="logs">{props.logs.slice(0, 8).map((log, index) => <div className="log-line" key={`${log}-${index}`}><span className={index === 0 ? 'log-dot active' : 'log-dot'} /><span className="log-message">{log}</span></div>)}</div><div className="run-summary"><div><span className="summary-label">草稿状态</span><strong>{props.saveState === 'saving' ? '保存中' : props.saveState === 'error' ? '保存失败' : '已保存'}</strong></div><div><span className="summary-label">节点</span><strong>{props.nodes.length}</strong></div><div><span className="summary-label">发布版本</span><strong className="mono">{props.publishedRevision ? `v${props.publishedRevision}` : '未发布'}</strong></div></div></div></section>}
   </>
 }
 
 function ArtifactView() {
-  const [artifacts, setArtifacts] = useState<Array<Artifact & { runId: string }>>([])
+  type RegistryArtifact = Artifact & { runId: string }
+  const [artifacts, setArtifacts] = useState<RegistryArtifact[]>([])
   const [status, setStatus] = useState('all')
-  const [detail, setDetail] = useState<{ artifact: Artifact & { runId: string }; payload: unknown } | null>(null)
+  const [detail, setDetail] = useState<{ artifact: RegistryArtifact; payload: unknown } | null>(null)
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const copyTimerRef = useRef<number | null>(null)
+
   const load = useCallback(() => {
     void fetch('/api/runs')
       .then(response => response.ok ? response.json() : [])
       .then((runs: Run[]) => setArtifacts(runs.flatMap(run => (run.artifacts ?? []).map(artifact => ({ ...artifact, runId: run.id })))))
   }, [])
+
   useEffect(() => { load(); const timer = window.setInterval(load, 2_000); return () => window.clearInterval(timer) }, [load])
-  const open = async (artifact: Artifact & { runId: string }) => {
+  useEffect(() => () => { if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current) }, [])
+
+  const artifactKey = (artifact: RegistryArtifact) => `${artifact.runId}:${artifact.id}`
+  const artifactUri = (artifact: RegistryArtifact) => `artifact://${artifact.runId}/${artifact.id}`
+  const statusTone = (artifact: RegistryArtifact) => artifact.status === 'valid' ? 'valid' : artifact.status === 'invalid' || artifact.status === 'rejected' ? 'failed' : 'pending'
+  const readPayload = async (artifact: RegistryArtifact) => {
+    if (detail && artifactKey(detail.artifact) === artifactKey(artifact)) return detail.payload
     const response = await fetch(`/api/runs/${artifact.runId}/artifacts/${artifact.id}`)
-    if (response.ok) setDetail({ artifact, payload: await response.json() })
+    if (!response.ok) throw new Error('无法读取此 Artifact。')
+    return response.json()
   }
+  const open = async (artifact: RegistryArtifact) => {
+    setActionError(null)
+    try {
+      setDetail({ artifact, payload: await readPayload(artifact) })
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '无法读取此 Artifact。')
+    }
+  }
+  const copyArtifactUri = async (artifact: RegistryArtifact) => {
+    if (!navigator.clipboard?.writeText) { setActionError('当前环境不支持复制到剪贴板。'); return }
+    try {
+      await navigator.clipboard.writeText(artifactUri(artifact))
+      const key = artifactKey(artifact)
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current)
+      setCopiedKey(key)
+      copyTimerRef.current = window.setTimeout(() => setCopiedKey(current => current === key ? null : current), 1500)
+    } catch {
+      setActionError('复制 Artifact URI 失败，请检查剪贴板权限。')
+    }
+  }
+  const downloadArtifact = async (artifact: RegistryArtifact) => {
+    setActionError(null)
+    try {
+      const payload = await readPayload(artifact)
+      const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }))
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `${artifact.id.replace(/[^a-zA-Z0-9._-]/g, '-') || 'artifact'}.json`
+      document.body.append(anchor)
+      anchor.click()
+      anchor.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : '下载 Artifact 失败。')
+    }
+  }
+
   const filtered = status === 'all' ? artifacts : artifacts.filter(artifact => artifact.status === status)
-  return <section className="content-view"><div className="view-heading"><div><span className="section-kicker">ARTIFACT REGISTRY</span><h1>Artifacts</h1><p>Schema 校验、内容哈希和上游血缘均随 Run 持久化。</p></div><label className="table-filter">状态<select value={status} onChange={event => setStatus(event.target.value)}><option value="all">全部状态</option><option value="valid">已验证</option><option value="awaiting_approval">待审批</option><option value="invalid">无效</option><option value="rejected">已拒绝</option></select></label></div><div className="stats-row"><div><span>总产物</span><strong>{artifacts.length}</strong></div><div><span>已验证</span><strong className="green-text">{artifacts.filter(item => item.status === 'valid').length}</strong></div><div><span>无效</span><strong>{artifacts.filter(item => item.status === 'invalid').length}</strong></div><div><span>待审批</span><strong className="amber-text">{artifacts.filter(item => item.status === 'awaiting_approval').length}</strong></div></div><div className="table-wrap"><div className="table-head"><span>类型</span><span>节点</span><span>Hash</span><span>状态</span><span>Schema</span><span /></div>{filtered.length ? filtered.map(artifact => <div className="table-row" key={artifact.id}><span>{artifact.type} v{artifact.version ?? 1}</span><b>{artifact.nodeId}</b><span className="mono">{artifact.contentHash.slice(0, 12)}</span><span><em className={`status-pill ${artifact.status === 'valid' ? 'valid' : artifact.status === 'invalid' || artifact.status === 'rejected' ? 'failed' : 'pending'}`}>{artifact.status}</em></span><span className="muted-text">v{artifact.schemaVersion ?? 1}</span><button className="row-action" onClick={() => void open(artifact)}>查看</button></div>) : <div className="empty-state">没有匹配此状态的 Artifact。</div>}</div>{detail && <DetailPanel title={`${detail.artifact.type} v${detail.artifact.version ?? 1}`} onClose={() => setDetail(null)}><div className="artifact-detail-meta"><span>Run</span><code>{detail.artifact.runId}</code><span>上游输入</span><div className="lineage-list">{detail.artifact.inputArtifactIds?.length ? detail.artifact.inputArtifactIds.map(id => <button key={id} onClick={() => { const upstream = artifacts.find(artifact => artifact.id === id); if (upstream) void open(upstream) }}>{id}</button>) : <em>无上游 Artifact</em>}</div></div><pre>{JSON.stringify(detail.payload, null, 2)}</pre></DetailPanel>}</section>
+  return <section className="content-view artifact-registry">
+    <div className="view-heading artifact-registry-heading"><div><span className="section-kicker">ARTIFACT REGISTRY</span><h1>Artifacts</h1><p>Schema 校验、SHA-256 内容哈希和上游血缘均随 Run 持久化。</p></div><label className="table-filter">状态<select value={status} onChange={event => setStatus(event.target.value)}><option value="all">全部状态</option><option value="valid">已验证</option><option value="awaiting_approval">待审批</option><option value="invalid">无效</option><option value="rejected">已拒绝</option></select></label></div>
+    <div className="stats-row artifact-stats"><div><span>总产物</span><strong>{artifacts.length}</strong></div><div><span>已验证</span><strong className="green-text">{artifacts.filter(item => item.status === 'valid').length}</strong></div><div><span>无效</span><strong>{artifacts.filter(item => item.status === 'invalid').length}</strong></div><div><span>待审批</span><strong className="amber-text">{artifacts.filter(item => item.status === 'awaiting_approval').length}</strong></div></div>
+    {actionError && <div className="artifact-action-notice" role="alert">{actionError}</div>}
+    {filtered.length ? <div className="artifact-grid">{filtered.map(artifact => {
+      const key = artifactKey(artifact)
+      const uri = artifactUri(artifact)
+      return <article className={`artifact-card ${statusTone(artifact)}`} key={key}>
+        <header><span className="artifact-card-icon"><Package aria-hidden="true" /></span><div><span className="section-kicker">{artifact.nodeId}</span><h2 title={artifact.type}>{artifact.type} <small>v{artifact.version ?? 1}</small></h2></div><em className={`status-pill ${statusTone(artifact)}`}>{artifact.status}</em></header>
+        <dl className="artifact-card-meta"><div><dt>Schema</dt><dd title={`${artifact.schemaId ?? 'artifact'} v${artifact.schemaVersion ?? 1}`}>{artifact.schemaId ?? 'artifact'} v{artifact.schemaVersion ?? 1}</dd></div><div><dt>SHA-256</dt><dd><code title={artifact.contentHash}>{artifact.contentHash.slice(0, 16)}</code></dd></div><div><dt>创建时间</dt><dd>{new Date(artifact.createdAt).toLocaleString('zh-CN')}</dd></div></dl>
+        <footer><code className="artifact-uri" title={uri}>{uri}</code><div className="artifact-card-actions"><button className="header-icon-button" type="button" title="预览 Artifact" aria-label="预览 Artifact" onClick={() => void open(artifact)}><Eye aria-hidden="true" /></button><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(artifact)}>{copiedKey === key ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(artifact)}><Download aria-hidden="true" /></button></div></footer>
+      </article>
+    })}</div> : <div className="empty-state">没有匹配此状态的 Artifact。</div>}
+    {detail && <DetailPanel variant="modal" title={`${detail.artifact.type} v${detail.artifact.version ?? 1}`} onClose={() => setDetail(null)}><div className="artifact-detail-actions"><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(detail.artifact)}>{copiedKey === artifactKey(detail.artifact) ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(detail.artifact)}><Download aria-hidden="true" /></button></div><div className="artifact-detail-meta"><span>Run</span><code title={detail.artifact.runId}>{detail.artifact.runId}</code><span>Artifact URI</span><code title={artifactUri(detail.artifact)}>{artifactUri(detail.artifact)}</code><span>上游输入</span><div className="lineage-list">{detail.artifact.inputArtifactIds?.length ? detail.artifact.inputArtifactIds.map(id => <button key={id} onClick={() => { const upstream = artifacts.find(artifact => artifact.id === id); if (upstream) void open(upstream) }}>{id}</button>) : <em>无上游 Artifact</em>}</div></div><pre>{JSON.stringify(detail.payload, null, 2)}</pre></DetailPanel>}
+  </section>
 }
 
 function RunsView({ onOpenWorkflow }: { onOpenWorkflow: (run: Run, nodeId?: string) => void }) {
@@ -1003,7 +1245,7 @@ function RunsView({ onOpenWorkflow }: { onOpenWorkflow: (run: Run, nodeId?: stri
   return <section className="content-view"><div className="view-heading"><div><span className="section-kicker">EXECUTION HISTORY</span><h1>运行记录</h1><p>查看 Worktree、恢复状态、节点 Attempt 和交付结果。</p></div></div><div className="run-list">{runs.length === 0 ? <div className="empty-state">还没有运行记录。</div> : runs.map(run => { const recovered = hasRecoveredAttempt(run); return <button className="run-row run-row-button" key={run.id} onClick={() => setSelected(run)}><span className={`run-state ${run.status === 'succeeded' ? 'success' : run.status === 'failed' ? 'failed' : 'pending'}`}><i /></span><div><b>{run.id}</b><small>{new Date(run.startedAt).toLocaleString('zh-CN')}{recovered ? ' · 已从服务重启恢复' : ''}</small></div><span className="run-progress">{run.nodes.filter(node => node.state === 'success').length} / {run.nodes.length}</span><em className={`status-pill ${run.status === 'failed' ? 'failed' : run.status === 'succeeded' ? 'valid' : 'pending'}`}>{runStatusLabel(run.status)}</em><span>›</span></button> })}</div>{selected && <DetailPanel title={selected.id} onClose={() => setSelected(null)}>{hasRecoveredAttempt(selected) && <div className="recovery-notice"><b>已恢复此运行</b><span>服务重启后，未完成的 Attempt 已标记为 process_lost 并从可运行节点继续。</span></div>}{actionError && <div className="executor-notice error">{actionError}</div>}<div className="run-detail-actions"><button className="ghost-btn" onClick={() => onOpenWorkflow(selected)}>在工作流中查看</button>{['running', 'preparing', 'awaiting_approval'].includes(selected.status) && <button className="reject-btn" onClick={() => void cancel(selected.id)}>取消运行</button>}</div><div className="run-detail-meta"><b>Worktree</b><div className="path-with-action"><code>{selected.worktreePath ?? '准备中'}</code>{selected.worktreePath && window.artifactDesktop && <button className="ghost-btn" title="在 Finder 中显示 Worktree" onClick={() => void showWorktree(selected.worktreePath!)}>在 Finder 中显示</button>}</div><b>Branch</b><code>{selected.branchName ?? '—'}</code><b>状态</b><code>{runStatusLabel(selected.status)}</code></div><div className="attempt-list">{selected.nodes.map(node => <div className="attempt-row" key={node.id}><div><b>{node.id}</b><small>{stateLabel(node.state as NodeState)} · {node.attempts?.length ?? 0} Attempts</small>{node.attempts?.at(-1)?.exitReason && <p>{node.attempts.at(-1)?.exitReason}</p>}</div><div className="attempt-actions"><button className="text-btn" onClick={() => onOpenWorkflow(selected, node.id)}>定位节点</button>{['failed', 'skipped', 'cancelled'].includes(node.state) && <button className="ghost-btn" disabled={retryingNode === node.id} onClick={() => void retry(selected.id, node.id)}>{retryingNode === node.id ? '重试中…' : '从此节点重试'}</button>}</div></div>)}</div><pre>{selected.logs.join('\n')}</pre></DetailPanel>}</section>
 }
 
-function DetailPanel({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+function DetailPanel({ title, onClose, children, variant = 'drawer' }: { title: string; onClose: () => void; children: React.ReactNode; variant?: 'drawer' | 'modal' }) {
   const [closing, setClosing] = useState(false)
   const panelRef = useRef<HTMLElement>(null)
   const closeTimer = useRef<number | null>(null)
@@ -1019,7 +1261,7 @@ function DetailPanel({ title, onClose, children }: { title: string; onClose: () 
     closeTimer.current = window.setTimeout(() => {
       closeTimer.current = null
       onCloseRef.current()
-    }, 240)
+    }, 200)
   }, [])
   closeRef.current = close
   useEffect(() => {
@@ -1033,7 +1275,7 @@ function DetailPanel({ title, onClose, children }: { title: string; onClose: () 
       if (previousFocus.current instanceof HTMLElement) previousFocus.current.focus()
     }
   }, [])
-  return <div className={`detail-overlay ${closing ? 'closing' : ''}`} onClick={close}><aside ref={panelRef} className="detail-panel" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} onClick={event => event.stopPropagation()}><header><h2>{title}</h2><button aria-label="关闭详情" onClick={close}>×</button></header>{children}</aside></div>
+  return createPortal(<div className="app-shell app-overlay-scope"><div className={`detail-overlay detail-overlay-${variant} ${closing ? 'closing' : ''}`} onClick={close}><aside ref={panelRef} className="detail-panel" role="dialog" aria-modal="true" aria-label={title} tabIndex={-1} onClick={event => event.stopPropagation()}><header><h2>{title}</h2><button className="header-icon-button detail-close-button" type="button" title="关闭详情" aria-label="关闭详情" onClick={close}><X aria-hidden="true" /></button></header>{children}</aside></div></div>, document.body)
 }
 
 function hasRecoveredAttempt(run: Run): boolean { return run.nodes.some(node => node.attempts?.some(attempt => attempt.exitReason === 'process_lost')) }

@@ -41,6 +41,7 @@ app.on('before-quit', () => {
 
 if (singleInstance) {
   void app.whenReady().then(async () => {
+    if (process.platform === 'darwin' && !app.isPackaged) app.dock?.setIcon(join(__dirname, '..', '..', 'build', 'icon.png'))
     registerDesktopHandlers()
     if (pendingProjectPath) {
       await openProject(pendingProjectPath, false)
@@ -60,7 +61,7 @@ function createWindow(url: string): void {
     height: 940,
     minWidth: 1080,
     minHeight: 720,
-    backgroundColor: '#f7f8fa',
+    backgroundColor: '#080c14',
     show: false,
     title: 'Artifact',
     titleBarStyle: 'default',

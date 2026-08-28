@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const generatedDirectories = [".next", "dist-electron", "dist-cli", "release"];
+const generatedDirectories = [".next", ".next-electron-dev", "dist-electron", "dist-cli", "release"];
 const dryRun = process.argv.includes("--dry-run");
 
 for (const directory of generatedDirectories) {

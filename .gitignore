@@ -1,5 +1,6 @@
 node_modules/
 .next/
+.next-electron-dev/
 out/
 dist/
 dist-cli/
