@@ -1,9 +1,10 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { schemaFor, validatePayload } from './artifact-schema'
 import { loadExecutorConfigs, refreshExecutorAuthentication, type ExecutorConfig } from './executor-config'
+import { notifyRunChanged } from './run-events'
 import { approveProjectCommand, isProjectCommandApproved, loadProject, type CommandSpec, type ProjectCommandKey, type ProjectConfig } from './project'
 
 export type RunNodeState = 'idle' | 'running' | 'paused' | 'success' | 'waiting' | 'failed' | 'cancelled' | 'skipped'
@@ -12,32 +13,48 @@ export type RunInputAttachment = { id: string; name: string; mediaType: string; 
 export type RunInput = { text: string; attachments: RunInputAttachment[]; submittedAt?: string }
 export type WorkflowRunReference = { workflowId: string; workflowName: string; revision: number; publishedAt: string }
 export type RunEvent = { id: string; occurredAt: string; type: 'run-created' | 'run-state' | 'node-state' | 'command' | 'executor' | 'artifact' | 'operator' | 'activity' | 'error'; message: string; nodeId?: string; attemptId?: string; details?: Record<string, string | number | boolean | null> }
-export type StepAttempt = { id: string; attempt: number; executorId: string; executorSnapshot?: Pick<ExecutorConfig, 'id' | 'path' | 'model' | 'profile' | 'version'>; status: 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled'; startedAt: string; endedAt?: string; exitReason?: string; output?: string; inputArtifactIds?: string[] }
+export type AgentTraceEvent = { schemaVersion: 1; seq: number; occurredAt: string; executorId: string; nodeId: string; attemptId: string; kind: 'status' | 'agent_message' | 'reasoning_summary' | 'tool_started' | 'tool_completed' | 'error'; sourceEventId?: string; toolName?: string; content?: string; command?: string; status?: string; exitCode?: number; durationMs?: number; truncated?: boolean; redacted?: boolean }
+export type AgentPromptSnapshot = { schemaVersion: 1; createdAt: string; contentHash: string; runtimeInstruction: string; nodeInstruction: string; renderedPrompt: string; inputArtifactIds: string[]; redacted: boolean }
+export type StepAttempt = { id: string; attempt: number; executorId: string; executorSnapshot?: Pick<ExecutorConfig, 'id' | 'path' | 'model' | 'profile' | 'version'>; status: 'running' | 'paused' | 'succeeded' | 'failed' | 'cancelled'; startedAt: string; endedAt?: string; exitReason?: string; output?: string; inputArtifactIds?: string[]; promptSnapshot?: AgentPromptSnapshot; trace?: AgentTraceEvent[]; traceOmittedCount?: number; finalResponse?: string; finalResponseRedacted?: boolean; finalResponseTruncated?: boolean }
 export type RunNode = { id: string; kind: string; executorId?: string; prompt?: string; outputType?: string; state: RunNodeState; attempts: StepAttempt[]; steeringArtifactIds?: string[] }
 export type RunEdge = { from: string; to: string }
-export type RunArtifact = { id: string; nodeId: string; type: string; version: number; schemaId: string; schemaVersion: number; status: 'valid' | 'awaiting_approval' | 'rejected' | 'invalid'; path: string; contentHash: string; inputArtifactIds: string[]; validationErrors: string[]; createdAt: string }
+export type RunArtifact = { id: string; nodeId: string; attemptId?: string; type: string; version: number; schemaId: string; schemaVersion: number; status: 'valid' | 'awaiting_approval' | 'rejected' | 'invalid'; path: string; contentHash: string; inputArtifactIds: string[]; validationErrors: string[]; createdAt: string }
 export type PendingCommandApproval = { nodeId: string; commandKey: ProjectCommandKey; command: CommandSpec; requestedAt: string }
 export type RunSnapshot = { id: string; status: RunStatus; startedAt: string; endedAt?: string; project: ProjectConfig; workflow?: WorkflowRunReference; input: RunInput; baseGitRef?: string; branchName?: string; worktreePath?: string; pendingCommandApproval?: PendingCommandApproval; nodes: RunNode[]; edges: RunEdge[]; logs: string[]; events: RunEvent[]; artifacts: RunArtifact[] }
 export type StartRunInput = { nodes: Array<Omit<RunNode, 'state' | 'attempts' | 'steeringArtifactIds'>>; edges?: RunEdge[]; input?: RunInput; workflow?: WorkflowRunReference }
 type AgentActivity = { type: 'executor' | 'command' | 'activity'; message: string; details?: Record<string, string | number | boolean | null> }
 type AgentRunnerResult = { output: string; activities?: AgentActivity[] }
-type AgentRunner = (input: { prompt: string; cwd: string; writable: boolean; executor: ExecutorConfig; attemptId: string }) => Promise<string | AgentRunnerResult>
+type AgentTraceDraft = Omit<AgentTraceEvent, 'schemaVersion' | 'seq' | 'occurredAt' | 'executorId' | 'nodeId' | 'attemptId'>
+type AgentRunner = (input: { prompt: string; cwd: string; writable: boolean; executor: ExecutorConfig; attemptId: string; attemptDirectory: string; environment: NodeJS.ProcessEnv; onPublicTrace?: (event: AgentTraceDraft) => Promise<void> }) => Promise<string | AgentRunnerResult>
+type AgentAdapter = { id: string; run: AgentRunner }
+type RunProcessOptions = { stdin?: string; env?: NodeJS.ProcessEnv; maxLineLength?: number; onStdoutLine?: (line: string) => void | Promise<void> }
 
 const stateRoot = () => process.env.ARTIFACT_STATE_DIR || join(process.cwd(), '.artifact')
 const artifactRoot = () => join(stateRoot(), 'runs')
 const worktreeRoot = () => join(stateRoot(), 'worktrees')
 const runDirectory = (id: string) => join(artifactRoot(), id)
 const manifestPath = (id: string) => join(runDirectory(id), 'manifest.json')
+const attemptDirectory = (runId: string, attemptId: string) => join(runDirectory(runId), 'attempts', attemptId)
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
+const publicTraceLimit = 300
+const publicTraceContentLimit = 12_000
+const publicTraceCommandLimit = 2_000
+const publicFinalResponseLimit = 100_000
+const publicTraceSchemaVersion = 1 as const
 const activeRuns = new Set<string>()
 const activeProcesses = new Map<string, ChildProcess>()
 let recoveryStarted = false
-let codexRunner: AgentRunner = runCodex
-let claudeRunner: AgentRunner = runClaude
+const builtInAgentAdapters = (): AgentAdapter[] => [
+  { id: 'codex', run: runCodex },
+  { id: 'claude', run: runClaude },
+]
+let agentAdapters = new Map(builtInAgentAdapters().map(adapter => [adapter.id, adapter]))
 
 export function configureRunManagerForTests(dependencies: { codexRunner?: AgentRunner; claudeRunner?: AgentRunner } = {}): void {
-  codexRunner = dependencies.codexRunner ?? runCodex
-  claudeRunner = dependencies.claudeRunner ?? runClaude
+  agentAdapters = new Map(builtInAgentAdapters().map(adapter => [adapter.id, {
+    ...adapter,
+    run: adapter.id === 'codex' ? dependencies.codexRunner ?? adapter.run : dependencies.claudeRunner ?? adapter.run,
+  }]))
 }
 
 export function validateRunGraph(nodes: Array<Pick<RunNode, 'id' | 'kind'>>, edges: RunEdge[] = []): void {
@@ -206,7 +223,15 @@ export async function resumeInterruptedRuns(): Promise<void> {
   let entries; try { entries = await readdir(artifactRoot(), { withFileTypes: true }) } catch { return }
   for (const entry of entries.filter(item => item.isDirectory())) {
     const run = await getRun(entry.name); if (!run || activeRuns.has(run.id) || (run.status !== 'running' && run.status !== 'preparing')) continue
-    for (const node of run.nodes.filter(item => item.state === 'running')) { node.state = 'idle'; const attempt = node.attempts.at(-1); if (attempt?.status === 'running') { attempt.status = 'failed'; attempt.endedAt = new Date().toISOString(); attempt.exitReason = 'process_lost' }; appendLog(run, `${node.id} · 服务重启，上一 Attempt 标记为 process_lost`) }
+    for (const node of run.nodes.filter(item => item.state === 'running')) {
+      node.state = 'idle'
+      const attempt = node.attempts.at(-1)
+      if (attempt?.status === 'running') {
+        attempt.status = 'failed'; attempt.endedAt = new Date().toISOString(); attempt.exitReason = 'process_lost'
+        if (node.kind === 'Agent') await appendAgentTrace(run, node, attempt, { kind: 'error', content: 'Executor process was lost during service restart.' })
+      }
+      appendLog(run, `${node.id} · 服务重启，上一 Attempt 标记为 process_lost`)
+    }
     run.status = 'running'; await saveRun(run); void processRun(run.id)
   }
 }
@@ -217,7 +242,7 @@ async function processRun(id: string): Promise<void> {
     let run = await getRun(id); if (!run || isTerminal(run.status) || run.status === 'awaiting_approval') return
     if (!run.worktreePath) {
       try { await prepareWorktree(run); run.status = 'running'; appendLog(run, `Worktree 已创建 · ${run.worktreePath}`); await saveRun(run) }
-      catch (error) { run.status = 'failed'; run.endedAt = new Date().toISOString(); appendLog(run, `Worktree 创建失败 · ${errorMessage(error)}`); await saveRun(run); return }
+      catch (error) { const failure = redactPublicText(errorMessage(error)).value; run.status = 'failed'; run.endedAt = new Date().toISOString(); appendLog(run, `Worktree 创建失败 · ${failure}`); await saveRun(run); return }
     }
     while (true) {
       run = await getRun(id); if (!run || run.status !== 'running') return
@@ -241,24 +266,36 @@ async function processRun(id: string): Promise<void> {
       const attempt: StepAttempt = { id: `attempt-${randomUUID()}`, attempt: ready.attempts.length + 1, executorId: ready.executorId ?? (ready.kind === 'Agent' ? 'codex' : 'local'), status: 'running', startedAt: new Date().toISOString() }
       ready.attempts.push(attempt); ready.state = 'running'; appendLog(run, `${ready.id} · Attempt ${attempt.attempt} 开始执行`); await saveRun(run)
       try {
-        if (ready.kind === '审批') { ready.state = 'waiting'; run.status = 'awaiting_approval'; appendLog(run, `${ready.id} · 等待人工审批`); await writeArtifact(run, ready, reportPayload('等待人工审批', '该节点已暂停，等待人工审批。'), 'awaiting_approval'); await saveRun(run); return }
+        if (ready.kind === '审批') { ready.state = 'waiting'; run.status = 'awaiting_approval'; appendLog(run, `${ready.id} · 等待人工审批`); await writeArtifact(run, ready, reportPayload('等待人工审批', '该节点已暂停，等待人工审批。'), { status: 'awaiting_approval', attemptId: attempt.id }); await saveRun(run); return }
         const payload = await executeNode(run, ready, attempt)
         const latest = await getRun(id); if (!latest || latest.status !== 'running') return
-        const node = latest.nodes.find(item => item.id === ready.id); const latestAttempt = node?.attempts.find(item => item.id === attempt.id); if (!node || !latestAttempt) return
-        const artifact = await writeArtifact(latest, node, payload)
+        const node = latest.nodes.find(item => item.id === ready.id); const latestAttempt = node?.attempts.find(item => item.id === attempt.id)
+        if (!node || !latestAttempt || node.state !== 'running' || latestAttempt.status !== 'running') return
+        if (node.kind === 'Agent') setAttemptFinalResponse(latestAttempt, payload.content)
+        const artifact = await writeArtifact(latest, node, payload, { attemptId: latestAttempt.id })
 
         if (typeof payload.codeDiff === 'string') {
-          await writeArtifact(latest, { ...node, outputType: 'code-diff' }, reportPayload(payload.codeDiff ? '代码 Diff 已生成' : '没有检测到代码 Diff', payload.codeDiff || '当前节点没有产生受 Git 跟踪的代码变更。'))
+          await writeArtifact(latest, { ...node, outputType: 'code-diff' }, reportPayload(payload.codeDiff ? '代码 Diff 已生成' : '没有检测到代码 Diff', payload.codeDiff || '当前节点没有产生受 Git 跟踪的代码变更。'), { attemptId: latestAttempt.id })
         }
         if (artifact.status === 'invalid') { await saveRun(latest); throw new Error(`Artifact schema validation failed: ${artifact.validationErrors.join(', ')}`) }
-        node.state = 'success'; latestAttempt.status = 'succeeded'; latestAttempt.endedAt = new Date().toISOString(); latestAttempt.output = payload.summary; appendLog(latest, `${node.id} · 执行完成，Artifact v${artifact.version} 已通过 Schema 校验`); await saveRun(latest)
+        node.state = 'success'; latestAttempt.status = 'succeeded'; latestAttempt.endedAt = new Date().toISOString(); latestAttempt.output = payload.summary
+        if (node.kind === 'Agent') await appendAgentTrace(latest, node, latestAttempt, { kind: 'status', content: 'Agent execution completed.' })
+        appendLog(latest, `${node.id} · 执行完成，Artifact v${artifact.version} 已通过 Schema 校验`); await saveRun(latest)
       } catch (error) {
         const latest = await getRun(id); if (!latest || latest.status !== 'running') return
-        const node = latest.nodes.find(item => item.id === ready.id); const latestAttempt = node?.attempts.find(item => item.id === attempt.id); if (!node || !latestAttempt) return
-        node.state = 'failed'; latestAttempt.status = 'failed'; latestAttempt.endedAt = new Date().toISOString(); latestAttempt.exitReason = errorMessage(error); markDownstream(latest, node.id, 'skipped'); latest.status = 'failed'; latest.endedAt = new Date().toISOString(); appendLog(latest, `${node.id} · Attempt ${latestAttempt.attempt} 失败：${errorMessage(error)}`); await saveRun(latest); return
+        const node = latest.nodes.find(item => item.id === ready.id); const latestAttempt = node?.attempts.find(item => item.id === attempt.id)
+        if (!node || !latestAttempt || node.state !== 'running' || latestAttempt.status !== 'running') return
+        const failure = normalizePublicText(errorMessage(error), publicTraceContentLimit).value ?? 'Executor failed.'
+        node.state = 'failed'; latestAttempt.status = 'failed'; latestAttempt.endedAt = new Date().toISOString(); latestAttempt.exitReason = failure
+        if (node.kind === 'Agent') await appendAgentTrace(latest, node, latestAttempt, { kind: 'error', content: failure })
+        markDownstream(latest, node.id, 'skipped'); latest.status = 'failed'; latest.endedAt = new Date().toISOString(); appendLog(latest, `${node.id} · Attempt ${latestAttempt.attempt} 失败：${failure}`); await saveRun(latest); return
       }
     }
-  } finally { activeRuns.delete(id) }
+  } finally {
+    activeRuns.delete(id)
+    const latest = await getRun(id)
+    if (latest?.status === 'running' && latest.nodes.some(node => node.state === 'idle' && parentsSucceeded(latest, node.id))) void processRun(id)
+  }
 }
 
 async function prepareWorktree(run: RunSnapshot): Promise<void> {
@@ -280,17 +317,46 @@ async function executeNode(run: RunSnapshot, node: RunNode, attempt: StepAttempt
   if (node.kind === 'Agent') {
     const executors = await loadExecutorConfigs(); const executor = executors.find(item => item.id === (node.executorId ?? 'codex'))
     assertExecutorReady(executor, node.executorId ?? 'codex')
-    const runner = executor.id === 'codex' ? codexRunner : executor.id === 'claude' ? claudeRunner : undefined
-    if (!runner) throw new Error(`Executor adapter not implemented: ${executor.id}`)
+    const adapter = agentAdapters.get(executor.id)
+    if (!adapter) throw new Error(`Executor adapter not implemented: ${executor.id}`)
     attempt.executorSnapshot = { id: executor.id, path: executor.path, model: executor.model, profile: executor.profile, version: executor.version }
-    const inputs = await inputPackage(run, node); attempt.inputArtifactIds = inputs.artifactIds; appendEvent(run, 'executor', `${node.id} · 已冻结 ${inputs.artifactIds.length} 个输入 Artifact`, node.id, attempt.id, { executor: executor.id, model: executor.model || 'default' }); await saveRun(run)
+    const inputs = await inputPackage(run, node); attempt.inputArtifactIds = inputs.artifactIds
     const writable = node.id.toLowerCase().includes('implementation') || ['code-change', 'implementation-report'].includes(node.outputType ?? '')
-    const instruction = writable ? 'Implement the requested changes in this Git worktree. You may edit files. Run focused checks when practical. Do not commit, push, or modify anything outside the worktree.' : 'Analyze the request and produce a concrete report. Do not modify files.'
-    const result = normalizeAgentResult(await runner({ prompt: `${instruction}\n\nNode instruction:\n${node.prompt?.trim() || `Complete workflow node ${node.id}.`}\n\nFrozen upstream Artifact package:\n${inputs.content}`, cwd: run.worktreePath, writable, executor, attemptId: attempt.id }))
-    for (const activity of result.activities ?? []) appendEvent(run, activity.type, `${node.id} · ${activity.message}`, node.id, attempt.id, activity.details)
+    const runtimeInstruction = writable ? 'Implement the requested changes in this Git worktree. You may edit files. Run focused checks when practical. Do not commit, push, or modify anything outside the worktree.' : 'Analyze the request and produce a concrete report. Do not modify files.'
+    const nodeInstruction = node.prompt?.trim() || `Complete workflow node ${node.id}.`
+    const renderedPrompt = `${runtimeInstruction}\n\nNode instruction:\n${nodeInstruction}\n\nFrozen upstream Artifact package:\n${inputs.content}`
+    const displayRuntimeInstruction = redactPublicText(runtimeInstruction)
+    const displayNodeInstruction = redactPublicText(nodeInstruction)
+    const displayPrompt = redactPublicText(renderedPrompt)
+    attempt.promptSnapshot = {
+      schemaVersion: 1,
+      createdAt: new Date().toISOString(),
+      contentHash: hash(renderedPrompt),
+      runtimeInstruction: displayRuntimeInstruction.value,
+      nodeInstruction: displayNodeInstruction.value,
+      renderedPrompt: displayPrompt.value,
+      inputArtifactIds: [...inputs.artifactIds],
+      redacted: displayRuntimeInstruction.redacted || displayNodeInstruction.redacted || displayPrompt.redacted,
+    }
+    appendEvent(run, 'executor', `${node.id} · 已冻结 ${inputs.artifactIds.length} 个输入 Artifact`, node.id, attempt.id, { executor: executor.id, model: executor.model || 'default' })
+    await appendAgentTrace(run, node, attempt, { kind: 'status', content: 'Prompt frozen and dispatched to executor.' })
+    await saveRun(run)
+    const result = normalizeAgentResult(await adapter.run({
+      prompt: renderedPrompt,
+      cwd: run.worktreePath,
+      writable,
+      executor,
+      attemptId: attempt.id,
+      attemptDirectory: attemptDirectory(run.id, attempt.id),
+      // The selected executor's local CLI supplies its own authenticated environment.
+      environment: agentEnvironment(),
+      onPublicTrace: event => persistAgentTrace(run.id, node.id, attempt.id, event),
+    }))
+    for (const activity of result.activities ?? []) await persistLegacyAgentActivity(run.id, node.id, attempt.id, activity)
+    const publicOutput = redactPublicText(result.output).value
     const changedFiles = writable ? (await runProcess('git', ['status', '--short'], run.worktreePath, 15_000)).split('\n').filter(Boolean) : []
     const codeDiff = writable ? await runProcess('git', ['diff', '--binary', '--no-ext-diff', run.baseGitRef ?? 'HEAD'], run.worktreePath, 30_000) : undefined
-    return { ...reportPayload(writable ? `完成代码执行，变更 ${changedFiles.length} 项` : 'Agent 报告已生成', result.output), changedFiles, ...(codeDiff === undefined ? {} : { codeDiff }) }
+    return { ...reportPayload(writable ? `完成代码执行，变更 ${changedFiles.length} 项` : 'Agent 报告已生成', publicOutput), changedFiles, ...(codeDiff === undefined ? {} : { codeDiff }) }
   }
   if (node.kind === '验证') return executeValidation(run, attempt.id)
   if (node.kind === '交付') { const diff = await runProcess('git', ['diff', '--no-ext-diff', '--stat', run.baseGitRef ?? 'HEAD'], run.worktreePath, 30_000); const status = await runProcess('git', ['status', '--short'], run.worktreePath, 15_000); return reportPayload('Git 交付报告已生成', `Worktree: ${run.worktreePath}\nBranch: ${run.branchName}\n\nChanged files:\n${status || '(none)'}\n\nDiff stat:\n${diff || '(none)'}`) }
@@ -305,6 +371,7 @@ async function validateAgentExecutors(nodes: Array<Omit<RunNode, 'state' | 'atte
     let executor = executors.find(item => item.id === id)
     if (executor?.status === 'available' && executor.authentication === 'unknown') executor = await refreshExecutorAuthentication(id)
     assertExecutorReady(executor, id)
+    if (!agentAdapters.has(executor.id)) throw new Error(`Executor adapter not implemented: ${executor.id}`)
   }
 }
 
@@ -313,6 +380,19 @@ function assertExecutorReady(executor: ExecutorConfig | undefined, requestedId: 
   if (executor.authentication !== 'authenticated' && executor.authentication !== 'api_key') {
     throw new Error(`Executor requires login before starting a run: ${executor.name}`)
   }
+}
+
+function agentEnvironment(): NodeJS.ProcessEnv {
+  const coreKeys = [
+    'PATH', 'HOME', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME', 'TERM', 'COLORTERM',
+    'LANG', 'LC_ALL', 'LC_CTYPE', 'NO_COLOR', 'FORCE_COLOR',
+    'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY',
+    'SSL_CERT_FILE', 'SSL_CERT_DIR', 'CODEX_CA_CERTIFICATE',
+  ]
+  const allowed = new Set(coreKeys)
+  for (const key of Object.keys(process.env)) if (key.startsWith('LC_')) allowed.add(key)
+  return Object.fromEntries([...allowed].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]]])) as NodeJS.ProcessEnv
 }
 
 async function executeValidation(run: RunSnapshot, attemptId: string): Promise<{ summary: string; content: string }> {
@@ -348,14 +428,14 @@ async function inputPackage(run: RunSnapshot, node: RunNode): Promise<{ content:
   return { content: JSON.stringify(records, null, 2), artifactIds: artifacts.map(artifact => artifact.id) }
 }
 
-async function writeArtifact(run: RunSnapshot, node: RunNode, payload: Record<string, unknown> & { summary: string; content: string }, requestedStatus: RunArtifact['status'] = 'valid'): Promise<RunArtifact> {
+async function writeArtifact(run: RunSnapshot, node: RunNode, payload: Record<string, unknown> & { summary: string; content: string }, options: { status?: RunArtifact['status']; attemptId?: string } = {}): Promise<RunArtifact> {
   const type = node.outputType ?? `${node.kind.toLowerCase()}-report`; const schema = schemaFor(type); const validationErrors = validatePayload(schema, payload); const version = run.artifacts.filter(item => item.type === type).length + 1; const artifactId = `${node.id}-${randomUUID()}`; const relativePath = join('artifacts', node.id, `v${version}`, 'payload.json'); const serialized = JSON.stringify(payload, null, 2)
   const parentIds = run.edges.filter(edge => edge.to === node.id).map(edge => edge.from)
   const inputArtifactIds = node.kind === '输入'
     ? run.artifacts.filter(item => item.type === 'run-input' && item.status === 'valid').slice(-1).map(item => item.id)
     : latestValidArtifacts(run, parentIds).map(artifact => artifact.id)
-  const artifact: RunArtifact = { id: artifactId, nodeId: node.id, type, version, schemaId: schema.$id, schemaVersion: schema.version, status: validationErrors.length ? 'invalid' : requestedStatus, path: relativePath, contentHash: hash(serialized), inputArtifactIds, validationErrors, createdAt: new Date().toISOString() }
-  const payloadPath = join(runDirectory(run.id), relativePath); await atomicWrite(payloadPath, serialized); await atomicWrite(join(dirname(payloadPath), 'payload.md'), payload.content); await atomicWrite(join(dirname(payloadPath), 'manifest.json'), JSON.stringify(artifact, null, 2)); run.artifacts.push(artifact); appendEvent(run, 'artifact', `${node.id} · 已创建 ${type} v${version}`, node.id, undefined, { artifactId, type, version }); return artifact
+  const artifact: RunArtifact = { id: artifactId, nodeId: node.id, ...(options.attemptId ? { attemptId: options.attemptId } : {}), type, version, schemaId: schema.$id, schemaVersion: schema.version, status: validationErrors.length ? 'invalid' : options.status ?? 'valid', path: relativePath, contentHash: hash(serialized), inputArtifactIds, validationErrors, createdAt: new Date().toISOString() }
+  const payloadPath = join(runDirectory(run.id), relativePath); await atomicWrite(payloadPath, serialized); await atomicWrite(join(dirname(payloadPath), 'payload.md'), payload.content); await atomicWrite(join(dirname(payloadPath), 'manifest.json'), JSON.stringify(artifact, null, 2)); run.artifacts.push(artifact); appendEvent(run, 'artifact', `${node.id} · 已创建 ${type} v${version}`, node.id, options.attemptId, { artifactId, type, version }); return artifact
 }
 
 async function saveArtifactManifest(run: RunSnapshot, artifact: RunArtifact): Promise<void> { await atomicWrite(join(dirname(join(runDirectory(run.id), artifact.path)), 'manifest.json'), JSON.stringify(artifact, null, 2)) }
@@ -363,7 +443,20 @@ function normalizeRun(run: RunSnapshot): RunSnapshot {
   run.project.environment.commandAllowlist ??= {}
   run.input = normalizeRunInput(run.input)
   run.events ??= []
-  run.nodes = (run.nodes ?? []).map(node => ({ ...node, attempts: node.attempts ?? [], steeringArtifactIds: node.steeringArtifactIds ?? [] }))
+  run.nodes = (run.nodes ?? []).map(node => ({
+    ...node,
+    attempts: (node.attempts ?? []).map(attempt => {
+      const trace = (attempt.trace ?? []).map(event => ({ ...event, schemaVersion: 1 as const, executorId: event.executorId || attempt.executorId }))
+      const promptSnapshot = attempt.promptSnapshot ? { ...attempt.promptSnapshot, schemaVersion: 1 as const } : undefined
+      return {
+        ...attempt,
+        trace,
+        ...(promptSnapshot ? { promptSnapshot } : {}),
+        traceOmittedCount: attempt.traceOmittedCount ?? Math.max(0, (trace.at(-1)?.seq ?? trace.length) - trace.length),
+      }
+    }),
+    steeringArtifactIds: node.steeringArtifactIds ?? [],
+  }))
   run.artifacts = (run.artifacts ?? []).map((artifact, index) => {
     const normalized = artifact as RunArtifact
     normalized.version ??= index + 1
@@ -397,7 +490,10 @@ function appendEvent(run: RunSnapshot, type: RunEvent['type'], message: string, 
 function appendLog(run: RunSnapshot, message: string): void { appendEvent(run, 'activity', message) }
 function isTerminal(status: RunStatus): boolean { return status === 'succeeded' || status === 'failed' || status === 'cancelled' }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error) }
-async function saveRun(run: RunSnapshot): Promise<void> { await atomicWrite(manifestPath(run.id), JSON.stringify(run, null, 2)) }
+async function saveRun(run: RunSnapshot): Promise<void> {
+  await atomicWrite(manifestPath(run.id), JSON.stringify(run, null, 2))
+  notifyRunChanged(run.id)
+}
 async function atomicWrite(path: string, content: string): Promise<void> { await mkdir(dirname(path), { recursive: true }); const temporary = `${path}.${randomUUID()}.tmp`; await writeFile(temporary, content, 'utf8'); await rename(temporary, path) }
 
 function normalizeRunInput(input: RunInput | undefined): RunInput {
@@ -425,31 +521,374 @@ function normalizeAgentResult(value: string | AgentRunnerResult): AgentRunnerRes
   return typeof value === 'string' ? { output: value, activities: [] } : { output: value.output, activities: value.activities ?? [] }
 }
 
-async function runCodex(input: { prompt: string; cwd: string; writable: boolean; executor: ExecutorConfig; attemptId: string }): Promise<AgentRunnerResult> {
-  const args = ['exec', '--ephemeral', '--skip-git-repo-check', '--sandbox', input.writable ? 'workspace-write' : 'read-only', '--json']; if (input.executor.model.trim()) args.push('--model', input.executor.model.trim()); args.push(input.prompt)
-  const stdout = await runProcess(input.executor.path, args, input.cwd, 1_800_000, input.attemptId)
-  const events = stdout.split('\n').flatMap(line => { try { return [JSON.parse(line) as { type?: string; item?: { type?: string; text?: string; command?: string; exit_code?: number } }] } catch { return [] } })
-  const messages = events.flatMap(event => event.type === 'item.completed' && event.item?.type === 'agent_message' && event.item.text ? [event.item.text] : [])
-  const activities: AgentActivity[] = []
-  for (const event of events) {
-    // Never persist reasoning items. Only retain public agent messages and explicit tool activity.
-    if (event.item?.type === 'agent_message' && event.item.text) activities.push({ type: 'activity', message: '执行器返回说明', details: { text: event.item.text.slice(0, 8_000) } })
-    if (event.item?.type === 'command_execution') {
-      const state = event.type === 'item.started' ? '开始执行命令' : event.type === 'item.completed' ? '命令执行完成' : '命令活动'
-      activities.push({ type: 'command', message: state, details: { command: event.item.command?.slice(0, 2_000) ?? '', exitCode: event.item.exit_code ?? null } })
-    }
-  }
-  return { output: messages.join('\n\n') || 'Codex completed without a textual report.', activities }
+function setAttemptFinalResponse(attempt: StepAttempt, finalResponse: string): void {
+  const normalized = normalizePublicText(finalResponse, publicFinalResponseLimit)
+  attempt.finalResponse = normalized.value
+  if (normalized.redacted || /\[REDACTED(?: [A-Z ]+)?\]/.test(normalized.value ?? '')) attempt.finalResponseRedacted = true
+  if (normalized.truncated) attempt.finalResponseTruncated = true
 }
 
-async function runClaude(input: { prompt: string; cwd: string; writable: boolean; executor: ExecutorConfig; attemptId: string }): Promise<AgentRunnerResult> {
-  const args = ['--print', '--output-format', 'json', '--permission-mode', input.writable ? 'acceptEdits' : 'plan']
+async function persistAgentTrace(runId: string, nodeId: string, attemptId: string, draft: AgentTraceDraft): Promise<void> {
+  const run = await getRun(runId)
+  const node = run?.nodes.find(item => item.id === nodeId)
+  const attempt = node?.attempts.find(item => item.id === attemptId)
+  if (!run || !node || !attempt || run.status !== 'running' || node.state !== 'running' || attempt.status !== 'running') return
+  const event = await appendAgentTrace(run, node, attempt, draft)
+  // Mirror tool activity into the run log so the global log panel stays alive while an agent works.
+  if (event.kind === 'tool_started' || event.kind === 'tool_completed') appendLog(run, toolTraceLogLabel(node.id, event))
+  await saveRun(run)
+}
+
+function toolTraceLogLabel(nodeId: string, event: AgentTraceEvent): string {
+  const action = event.kind === 'tool_started' ? '调用工具' : '工具完成'
+  const detail = event.command ?? event.content
+  return `${nodeId} · ${action} ${event.toolName ?? 'tool'}${detail ? `：${detail.slice(0, 160)}` : ''}`
+}
+
+async function persistLegacyAgentActivity(runId: string, nodeId: string, attemptId: string, activity: AgentActivity): Promise<void> {
+  const run = await getRun(runId)
+  const node = run?.nodes.find(item => item.id === nodeId)
+  const attempt = node?.attempts.find(item => item.id === attemptId)
+  if (!run || !node || !attempt || run.status !== 'running' || node.state !== 'running' || attempt.status !== 'running') return
+  const publicMessage = redactPublicText(activity.message).value
+  const publicDetails = redactEventDetails(activity.details)
+  appendEvent(run, activity.type, `${node.id} · ${publicMessage}`, node.id, attempt.id, publicDetails)
+  const content = typeof publicDetails?.text === 'string' ? publicDetails.text : activity.type === 'command' ? undefined : publicMessage
+  const command = typeof publicDetails?.command === 'string' ? publicDetails.command : undefined
+  const exitCode = typeof activity.details?.exitCode === 'number' ? activity.details.exitCode : undefined
+  const kind: AgentTraceEvent['kind'] = activity.type === 'command'
+    ? activity.message.includes('开始') ? 'tool_started' : 'tool_completed'
+    : activity.type === 'activity' ? 'agent_message' : 'status'
+  await appendAgentTrace(run, node, attempt, { kind, ...(content ? { content } : {}), ...(command ? { command } : {}), ...(exitCode === undefined ? {} : { exitCode }) })
+  await saveRun(run)
+}
+
+async function appendAgentTrace(run: RunSnapshot, node: RunNode, attempt: StepAttempt, draft: AgentTraceDraft): Promise<AgentTraceEvent> {
+  const normalized = normalizeTraceDraft(draft)
+  const event: AgentTraceEvent = {
+    schemaVersion: publicTraceSchemaVersion,
+    seq: (attempt.trace?.at(-1)?.seq ?? 0) + 1,
+    occurredAt: new Date().toISOString(),
+    executorId: attempt.executorId,
+    nodeId: node.id,
+    attemptId: attempt.id,
+    ...normalized,
+  }
+  const directory = attemptDirectory(run.id, attempt.id)
+  await mkdir(directory, { recursive: true })
+  await appendFile(join(directory, 'trace.jsonl'), `${JSON.stringify(event)}\n`, 'utf8')
+  attempt.trace = [...(attempt.trace ?? []), event].slice(-publicTraceLimit)
+  attempt.traceOmittedCount = Math.max(0, event.seq - attempt.trace.length)
+  return event
+}
+
+function normalizeTraceDraft(draft: AgentTraceDraft): AgentTraceDraft {
+  const sourceEventId = normalizePublicText(draft.sourceEventId, 200)
+  const toolName = normalizePublicText(draft.toolName, 200)
+  const content = normalizePublicText(draft.content, publicTraceContentLimit)
+  const command = normalizePublicText(draft.command, publicTraceCommandLimit)
+  const status = normalizePublicText(draft.status, 200)
+  return {
+    kind: draft.kind,
+    ...(sourceEventId.value === undefined ? {} : { sourceEventId: sourceEventId.value }),
+    ...(toolName.value === undefined ? {} : { toolName: toolName.value }),
+    ...(content.value === undefined ? {} : { content: content.value }),
+    ...(command.value === undefined ? {} : { command: command.value }),
+    ...(status.value === undefined ? {} : { status: status.value }),
+    ...(typeof draft.exitCode === 'number' && Number.isFinite(draft.exitCode) ? { exitCode: draft.exitCode } : {}),
+    ...(typeof draft.durationMs === 'number' && Number.isFinite(draft.durationMs) ? { durationMs: Math.max(0, Math.round(draft.durationMs)) } : {}),
+    ...((draft.truncated || sourceEventId.truncated || toolName.truncated || content.truncated || command.truncated || status.truncated) ? { truncated: true } : {}),
+    ...((draft.redacted || sourceEventId.redacted || toolName.redacted || content.redacted || command.redacted || status.redacted) ? { redacted: true } : {}),
+  }
+}
+
+function normalizePublicText(value: string | undefined, limit: number): { value?: string; truncated: boolean; redacted: boolean } {
+  if (typeof value !== 'string') return { truncated: false, redacted: false }
+  const publicValue = redactPublicText(value)
+  return publicValue.value.length > limit
+    ? { value: publicValue.value.slice(0, limit), truncated: true, redacted: publicValue.redacted }
+    : { value: publicValue.value, truncated: false, redacted: publicValue.redacted }
+}
+
+function redactPublicText(value: string): { value: string; redacted: boolean } {
+  const sentinels = ['[REDACTED]', '[REDACTED JWT]', '[REDACTED PRIVATE KEY]']
+  const protectedMarkers = sentinels.map((sentinel, index) => `__ARTIFACT_REDACTED_${index}__`)
+  let redacted = value
+  for (let index = 0; index < sentinels.length; index += 1) redacted = redacted.split(sentinels[index]).join(protectedMarkers[index])
+  const replacements: Array<[RegExp, string]> = [
+    [/(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|secret)\b["']?\s*[=:]\s*["']?)([^\s,"'\]\[}]+)/gi, '$1[REDACTED]'],
+    [/(\b(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|NPM_TOKEN)\b["']?\s*[=:]\s*["']?)([^\s,"'\]\[}]+)/g, '$1[REDACTED]'],
+    [/(\b[A-Z][A-Z0-9_]*(?:API_KEY|ACCESS_KEY|TOKEN|SECRET|PASSWORD|PASSWD)\b["']?\s*[=:]\s*["']?)([^\s,"'\]\[}]+)/g, '$1[REDACTED]'],
+    [/(\bAuthorization\s*:\s*Bearer\s+)[^\s,"']+/gi, '$1[REDACTED]'],
+    [/(\bAuthorization\s*:\s*Basic\s+)[^\s,"']+/gi, '$1[REDACTED]'],
+    [/([?&](?:api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)=)[^&#\s]+/gi, '$1[REDACTED]'],
+    [/\b(?:sk-[A-Za-z0-9_-]{16,}|github_pat_[A-Za-z0-9_]{16,}|gh[pousr]_[A-Za-z0-9]{16,}|AKIA[A-Z0-9]{16})\b/g, '[REDACTED]'],
+    [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, '[REDACTED JWT]'],
+    [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED PRIVATE KEY]'],
+  ]
+  for (const [pattern, replacement] of replacements) redacted = redacted.replace(pattern, replacement)
+  for (let index = 0; index < sentinels.length; index += 1) redacted = redacted.split(protectedMarkers[index]).join(sentinels[index])
+  return { value: redacted, redacted: redacted !== value }
+}
+
+function redactEventDetails(details: AgentActivity['details']): AgentActivity['details'] {
+  if (!details) return undefined
+  return Object.fromEntries(Object.entries(details).map(([key, value]) => [key, typeof value === 'string' ? redactPublicText(value).value : value]))
+}
+
+type CodexJsonItem = { id?: unknown; type?: unknown; text?: unknown; command?: unknown; exit_code?: unknown; status?: unknown; summary?: unknown; summary_text?: unknown; changes?: unknown; server?: unknown; tool?: unknown; name?: unknown }
+type CodexJsonEvent = { type?: unknown; item?: CodexJsonItem; error?: unknown; message?: unknown }
+
+// Adapter boundary: Codex-native JSON is normalized before it reaches persisted public trace data.
+async function runCodex(input: Parameters<AgentRunner>[0]): Promise<AgentRunnerResult> {
+  const finalMessagePath = join(input.attemptDirectory, 'last-message.txt')
+  await mkdir(input.attemptDirectory, { recursive: true })
+  const args = [
+    'exec', '--ephemeral', '--skip-git-repo-check', '--sandbox', input.writable ? 'workspace-write' : 'read-only',
+    '--json', '--color', 'never', '--output-last-message', finalMessagePath,
+    '-c', 'shell_environment_policy.inherit=core',
+    '-c', 'shell_environment_policy.exclude=["OPENAI_API_KEY","CODEX_API_KEY","CODEX_ACCESS_TOKEN","ANTHROPIC_API_KEY","ARTIFACT_SESSION_TOKEN"]',
+  ]
   if (input.executor.model.trim()) args.push('--model', input.executor.model.trim())
-  args.push(input.prompt)
-  const stdout = await runProcess(input.executor.path, args, input.cwd, 1_800_000, input.attemptId)
-  const output = parseClaudeResult(stdout)
-  const result = output || 'Claude Code completed without a textual report.'
-  return { output: result, activities: [{ type: 'activity', message: '执行器返回说明', details: { text: result.slice(0, 8_000) } }] }
+  args.push('-')
+  const messages: string[] = []
+  const startedTools = new Map<string, number>()
+  let parseErrorCount = 0
+  const heartbeat = startSilenceHeartbeat(idleMs => input.onPublicTrace?.({ kind: 'status', content: `Codex 仍在运行，约 ${Math.max(1, Math.round(idleMs / 60_000))} 分钟没有新事件。` }) ?? Promise.resolve())
+  try {
+    await runProcess(input.executor.path, args, input.cwd, 1_800_000, input.attemptId, {
+      stdin: input.prompt,
+      env: input.environment,
+      maxLineLength: 1_000_000,
+      onStdoutLine: async line => {
+        heartbeat.touch()
+        let event: CodexJsonEvent
+        try { event = JSON.parse(line) as CodexJsonEvent } catch { parseErrorCount += 1; return }
+        const eventType = typeof event.type === 'string' ? event.type : ''
+        const item = event.item
+        const itemType = typeof item?.type === 'string' ? item.type : ''
+        const sourceEventId = typeof item?.id === 'string' ? item.id : undefined
+        if (eventType === 'turn.failed') {
+          const failure = codexErrorMessage(event)
+          if (failure) await input.onPublicTrace?.({ kind: 'error', content: failure })
+          return
+        }
+        if (eventType === 'item.completed' && itemType === 'agent_message' && typeof item?.text === 'string' && item.text.trim()) {
+          const message = item.text.trim()
+          messages.push(message)
+          await input.onPublicTrace?.({ kind: 'agent_message', ...(sourceEventId ? { sourceEventId } : {}), content: message })
+          return
+        }
+        const summary = publicReasoningSummary(event)
+        if (summary) {
+          await input.onPublicTrace?.({ kind: 'reasoning_summary', ...(sourceEventId ? { sourceEventId } : {}), content: summary })
+          return
+        }
+        const toolName = codexToolName(itemType, item)
+        if (!toolName) return
+        const command = itemType === 'command_execution' && typeof item?.command === 'string' ? item.command : undefined
+        const status = typeof item?.status === 'string' ? item.status : undefined
+        const fileChangePaths = itemType === 'file_change' && Array.isArray(item?.changes)
+          ? item.changes.flatMap(change => change && typeof change === 'object' && typeof (change as { path?: unknown }).path === 'string' ? [(change as { path: string }).path] : []).slice(0, 30)
+          : undefined
+        if (eventType === 'item.started') {
+          if (sourceEventId) startedTools.set(sourceEventId, Date.now())
+          await input.onPublicTrace?.({ kind: 'tool_started', ...(sourceEventId ? { sourceEventId } : {}), toolName, ...(command ? { command } : {}), ...(status ? { status } : {}) })
+        } else if (eventType === 'item.completed') {
+          const startedAt = sourceEventId ? startedTools.get(sourceEventId) : undefined
+          if (sourceEventId) startedTools.delete(sourceEventId)
+          await input.onPublicTrace?.({
+            kind: 'tool_completed',
+            ...(sourceEventId ? { sourceEventId } : {}),
+            toolName,
+            ...(command ? { command } : {}),
+            ...(fileChangePaths?.length ? { content: `变更文件：${fileChangePaths.join('、')}` } : {}),
+            ...(status ? { status } : {}),
+            ...(typeof item?.exit_code === 'number' ? { exitCode: item.exit_code } : {}),
+            ...(startedAt === undefined ? {} : { durationMs: Date.now() - startedAt }),
+          })
+        }
+      },
+    })
+  } finally {
+    heartbeat.stop()
+    if (parseErrorCount) await input.onPublicTrace?.({ kind: 'error', content: `Ignored ${parseErrorCount} malformed executor event${parseErrorCount === 1 ? '' : 's'}.` })
+  }
+  let finalMessage = ''
+  try { finalMessage = (await readFile(finalMessagePath, 'utf8')).trim() } catch { /* fall back to the normalized event stream */ }
+  return { output: finalMessage || messages.at(-1) || 'Codex completed without a textual report.' }
+}
+
+function publicReasoningSummary(event: CodexJsonEvent): string | undefined {
+  const eventType = typeof event.type === 'string' ? event.type : ''
+  const item = event.item
+  const itemType = typeof item?.type === 'string' ? item.type : ''
+  if (eventType !== 'item.completed' && eventType !== 'reasoning_summary') return undefined
+  if (itemType === 'reasoning_summary' || itemType === 'reasoning_summary_text') {
+    const value = typeof item?.summary_text === 'string' ? item.summary_text : typeof item?.text === 'string' ? item.text : undefined
+    return value?.trim() || undefined
+  }
+  if (itemType !== 'reasoning') return undefined
+  if (typeof item?.summary_text === 'string' && item.summary_text.trim()) return item.summary_text.trim()
+  if (typeof item?.summary === 'string' && item.summary.trim()) return item.summary.trim()
+  if (!Array.isArray(item?.summary)) return undefined
+  const parts = item.summary.flatMap(part => {
+    if (!part || typeof part !== 'object') return []
+    const value = part as { type?: unknown; text?: unknown }
+    return value.type === 'summary_text' && typeof value.text === 'string' && value.text.trim() ? [value.text.trim()] : []
+  })
+  return parts.length ? parts.join('\n\n') : undefined
+}
+
+function codexToolName(itemType: string, item: CodexJsonItem | undefined): string | undefined {
+  if (itemType === 'command_execution') return 'shell'
+  if (itemType === 'file_change') return 'file_change'
+  if (itemType === 'web_search') return 'web_search'
+  if (itemType === 'mcp_tool_call') {
+    const server = typeof item?.server === 'string' ? item.server : 'mcp'
+    const tool = typeof item?.tool === 'string' ? item.tool : typeof item?.name === 'string' ? item.name : 'tool'
+    return `${server}/${tool}`
+  }
+  return undefined
+}
+
+function codexErrorMessage(event: CodexJsonEvent): string | undefined {
+  if (typeof event.message === 'string' && event.message.trim()) return event.message.trim()
+  if (typeof event.error === 'string' && event.error.trim()) return event.error.trim()
+  if (event.error && typeof event.error === 'object' && 'message' in event.error && typeof event.error.message === 'string') return event.error.message.trim() || undefined
+  return undefined
+}
+
+// Claude Code streams JSONL while it works; parse each line so the run workspace can
+// show thinking, tool calls, and results as they happen instead of after the process exits.
+type ClaudeContentBlock = { type?: unknown; text?: unknown; thinking?: unknown; id?: unknown; name?: unknown; input?: unknown; tool_use_id?: unknown; content?: unknown; is_error?: unknown }
+type ClaudeStreamEvent = { type?: unknown; subtype?: unknown; message?: { role?: unknown; content?: unknown }; result?: unknown; is_error?: unknown; error?: unknown; model?: unknown }
+
+async function runClaude(input: Parameters<AgentRunner>[0]): Promise<AgentRunnerResult> {
+  const args = ['--print', '--output-format', 'stream-json', '--verbose', '--permission-mode', input.writable ? 'acceptEdits' : 'plan']
+  if (input.executor.model.trim()) args.push('--model', input.executor.model.trim())
+  const startedTools = new Map<string, { name: string; startedAt: number }>()
+  const heartbeat = startSilenceHeartbeat(idleMs => input.onPublicTrace?.({ kind: 'status', content: `Claude Code 仍在运行，约 ${Math.max(1, Math.round(idleMs / 60_000))} 分钟没有新事件。` }) ?? Promise.resolve())
+  try {
+    const stdout = await runProcess(input.executor.path, args, input.cwd, 1_800_000, input.attemptId, {
+      stdin: input.prompt,
+      env: input.environment,
+      maxLineLength: 1_000_000,
+      onStdoutLine: async line => {
+        heartbeat.touch()
+        let event: ClaudeStreamEvent
+        try { event = JSON.parse(line) as ClaudeStreamEvent } catch { return }
+        await emitClaudeStreamEvent(event, startedTools, input)
+      },
+    })
+    const output = parseClaudeResult(stdout)
+    return { output: output || 'Claude Code completed without a textual report.' }
+  } finally {
+    heartbeat.stop()
+  }
+}
+
+async function emitClaudeStreamEvent(event: ClaudeStreamEvent, startedTools: Map<string, { name: string; startedAt: number }>, input: Parameters<AgentRunner>[0]): Promise<void> {
+  const eventType = typeof event.type === 'string' ? event.type : ''
+  if (eventType === 'system') {
+    if (event.subtype === 'init') {
+      const model = typeof event.model === 'string' && event.model.trim() ? event.model.trim() : '默认模型'
+      await input.onPublicTrace?.({ kind: 'status', content: `Claude Code 会话已建立 · 模型 ${model}` })
+    }
+    return
+  }
+  if (eventType === 'assistant' || eventType === 'user') {
+    for (const block of claudeContentBlocks(event.message?.content)) {
+      await emitClaudeBlock(block, eventType, startedTools, input)
+    }
+    return
+  }
+  if (eventType === 'result' && typeof event.subtype === 'string' && event.subtype.startsWith('error')) {
+    await input.onPublicTrace?.({ kind: 'error', content: claudeErrorText(event) })
+  }
+}
+
+function claudeContentBlocks(content: unknown): ClaudeContentBlock[] {
+  if (typeof content === 'string') return content.trim() ? [{ type: 'text', text: content }] : []
+  if (!Array.isArray(content)) return []
+  return content.filter((block): block is ClaudeContentBlock => Boolean(block) && typeof block === 'object')
+}
+
+async function emitClaudeBlock(block: ClaudeContentBlock, role: 'assistant' | 'user', startedTools: Map<string, { name: string; startedAt: number }>, input: Parameters<AgentRunner>[0]): Promise<void> {
+  const blockType = typeof block.type === 'string' ? block.type : ''
+  if (role === 'assistant') {
+    if (blockType === 'thinking' && typeof block.thinking === 'string' && block.thinking.trim()) {
+      await input.onPublicTrace?.({ kind: 'reasoning_summary', content: block.thinking.trim() })
+      return
+    }
+    if (blockType === 'text' && typeof block.text === 'string' && block.text.trim()) {
+      await input.onPublicTrace?.({ kind: 'agent_message', content: block.text.trim() })
+      return
+    }
+    if (blockType === 'tool_use') {
+      const name = typeof block.name === 'string' && block.name.trim() ? block.name.trim() : 'tool'
+      const toolInput = claudeToolInput(block.input)
+      if (typeof block.id === 'string' && block.id) startedTools.set(block.id, { name, startedAt: Date.now() })
+      await input.onPublicTrace?.({ kind: 'tool_started', ...(typeof block.id === 'string' && block.id ? { sourceEventId: block.id } : {}), toolName: name, ...(toolInput.command ? { command: toolInput.command } : {}), ...(toolInput.summary ? { content: toolInput.summary } : {}) })
+    }
+    return
+  }
+  if (blockType === 'tool_result') {
+    const id = typeof block.tool_use_id === 'string' ? block.tool_use_id : undefined
+    const started = id ? startedTools.get(id) : undefined
+    if (id) startedTools.delete(id)
+    const preview = claudeToolResultPreview(block.content)
+    await input.onPublicTrace?.({
+      kind: 'tool_completed',
+      ...(id ? { sourceEventId: id } : {}),
+      toolName: started?.name ?? 'tool',
+      ...(preview ? { content: preview } : {}),
+      status: block.is_error === true ? 'error' : 'success',
+      ...(started ? { durationMs: Date.now() - started.startedAt } : {}),
+    })
+  }
+}
+
+function claudeToolInput(value: unknown): { command?: string; summary?: string } {
+  if (!value || typeof value !== 'object') return {}
+  const record = value as Record<string, unknown>
+  const command = typeof record.command === 'string' && record.command.trim() ? record.command.trim() : undefined
+  const target = typeof record.file_path === 'string' && record.file_path.trim() ? record.file_path.trim()
+    : typeof record.path === 'string' && record.path.trim() ? record.path.trim()
+    : typeof record.url === 'string' && record.url.trim() ? record.url.trim()
+    : typeof record.pattern === 'string' && record.pattern.trim() ? record.pattern.trim()
+    : undefined
+  return { ...(command ? { command } : {}), ...(target ? { summary: target } : {}) }
+}
+
+function claudeToolResultPreview(content: unknown): string | undefined {
+  const text = typeof content === 'string' ? content
+    : Array.isArray(content)
+      ? content.flatMap(item => item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string' ? [(item as { text: string }).text] : []).join(' ')
+      : undefined
+  const value = redactPublicText((text ?? '').trim().slice(0, 400)).value
+  return value || undefined
+}
+
+function claudeErrorText(event: ClaudeStreamEvent): string {
+  const result = typeof event.result === 'string' ? event.result : undefined
+  const error = event.error && typeof event.error === 'object' && typeof (event.error as { message?: unknown }).message === 'string'
+    ? (event.error as { message: string }).message
+    : typeof event.error === 'string' ? event.error : undefined
+  return result || error || `Claude Code 执行出错（${String(event.subtype ?? 'unknown')}）`
+}
+
+// Emits a status trace when an executor produces no output for a long stretch, so a
+// five-minute npm install does not look like a hung run.
+function startSilenceHeartbeat(notify: (idleMs: number) => Promise<void>): { touch: () => void; stop: () => void } {
+  let lastTouch = Date.now()
+  const timer = setInterval(() => {
+    const idleMs = Date.now() - lastTouch
+    if (idleMs < 45_000) return
+    lastTouch = Date.now()
+    void notify(idleMs)
+  }, 15_000)
+  return { touch: () => { lastTouch = Date.now() }, stop: () => clearInterval(timer) }
 }
 
 function parseClaudeResult(stdout: string): string | undefined {
@@ -467,14 +906,51 @@ function parseClaudeResult(stdout: string): string | undefined {
   return stdout.trim() || undefined
 }
 async function runShellCommand(command: string, cwd: string, timeoutMs: number, attemptId: string): Promise<string> { return runProcess('/bin/zsh', ['-lc', command], cwd, timeoutMs, attemptId) }
-async function runProcess(command: string, args: string[], cwd: string, timeoutMs: number, attemptId?: string): Promise<string> {
+async function runProcess(command: string, args: string[], cwd: string, timeoutMs: number, attemptId?: string, options: RunProcessOptions = {}): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] }); if (attemptId) activeProcesses.set(attemptId, child); let stdout = ''; let stderr = ''; const maxOutput = 2_000_000
-    child.stdout.on('data', chunk => { if (stdout.length < maxOutput) stdout += String(chunk) }); child.stderr.on('data', chunk => { if (stderr.length < maxOutput) stderr += String(chunk) })
-    let settled = false
-    const finish = (handler: () => void) => { if (settled) return; settled = true; clearTimeout(timer); if (attemptId) activeProcesses.delete(attemptId); handler() }
-    const timer = setTimeout(() => { child.kill('SIGTERM'); finish(() => reject(new Error(`Command timed out after ${timeoutMs}ms: ${command}`))) }, timeoutMs)
-    child.on('error', error => finish(() => reject(error)))
-    child.on('close', code => finish(() => code !== 0 ? reject(new Error((stderr || stdout).trim().slice(-8_000) || `${command} exited with code ${code}`)) : resolve(stdout.trim() || stderr.trim())))
+    const child = spawn(command, args, { cwd, env: options.env ?? process.env, stdio: [options.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] }); if (attemptId) activeProcesses.set(attemptId, child)
+    child.stdout!.setEncoding('utf8')
+    child.stderr!.setEncoding('utf8')
+    let stdout = ''; let stderr = ''; let stdoutRemainder = ''; let callbacks = Promise.resolve(); let callbackError: unknown; let remainderQueued = false; const maxOutput = 2_000_000; const maxLineLength = options.maxLineLength ?? maxOutput
+    const appendBounded = (current: string, value: string) => current.length >= maxOutput ? current : current + value.slice(0, maxOutput - current.length)
+    const queueLine = (line: string) => {
+      if (!options.onStdoutLine || !line.trim()) return
+      const bounded = line.slice(0, maxLineLength)
+      callbacks = callbacks.then(async () => {
+        try { await options.onStdoutLine?.(bounded) } catch (error) { callbackError ??= error }
+      })
+    }
+    child.stdout!.on('data', (value: string) => {
+      stdout = appendBounded(stdout, value)
+      if (!options.onStdoutLine) return
+      const lines = `${stdoutRemainder}${value}`.split(/\r?\n/)
+      stdoutRemainder = lines.pop() ?? ''
+      for (const line of lines) queueLine(line)
+      if (stdoutRemainder.length > maxLineLength) { queueLine(stdoutRemainder); stdoutRemainder = '' }
+    })
+    child.stderr!.on('data', (value: string) => { stderr = appendBounded(stderr, value) })
+    let settled = false; let timedOut = false; let forceKillTimer: NodeJS.Timeout | undefined
+    const finish = (handler: () => void) => { if (settled) return; settled = true; clearTimeout(timer); if (forceKillTimer) clearTimeout(forceKillTimer); if (attemptId) activeProcesses.delete(attemptId); handler() }
+    const drainCallbacks = () => {
+      if (!remainderQueued) { remainderQueued = true; queueLine(stdoutRemainder) }
+      return callbacks
+    }
+    const settleAfterCallbacks = (handler: () => void) => { void drainCallbacks().then(() => finish(() => callbackError ? reject(callbackError) : handler()), error => finish(() => reject(error))) }
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill('SIGTERM')
+      forceKillTimer = setTimeout(() => { if (!settled) child.kill('SIGKILL') }, 5_000)
+    }, timeoutMs)
+    child.on('error', error => settleAfterCallbacks(() => reject(error)))
+    child.on('close', (code, signal) => settleAfterCallbacks(() => {
+      if (timedOut) return reject(new Error(redactPublicText(`Command timed out after ${timeoutMs}ms: ${command}`).value))
+      // Structured stdout may contain private native events. Adapter failures expose stderr only.
+      const failureOutput = redactPublicText((stderr || (options.onStdoutLine ? '' : stdout)).trim().slice(-8_000)).value
+      return code !== 0 ? reject(new Error(failureOutput || `${command} ${signal ? `terminated by ${signal}` : `exited with code ${code}`}`)) : resolve(stdout.trim() || stderr.trim())
+    }))
+    if (options.stdin !== undefined && child.stdin) {
+      child.stdin.on('error', () => undefined)
+      child.stdin.end(options.stdin, 'utf8')
+    }
   })
 }

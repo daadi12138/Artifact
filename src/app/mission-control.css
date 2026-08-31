@@ -1032,6 +1032,19 @@ button > svg {
   white-space: nowrap;
 }
 
+.node-activity {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--info-bright);
+  font-size: 8px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .node-status {
   display: flex;
   align-items: center;
@@ -2091,9 +2104,40 @@ button > svg {
 
 .run-attempt-context {
   display: block;
-  margin-top: 8px;
   color: var(--text-disabled);
   font: 9px var(--font-mono);
+}
+
+.run-attempt-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 9px;
+}
+
+.run-attempt-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-disabled);
+  font: 9px var(--font-mono);
+}
+
+.run-attempt-picker select {
+  width: 154px;
+  height: 27px;
+  padding: 0 25px 0 8px;
+  border: 1px solid var(--button-border);
+  border-radius: 5px;
+  outline: 0;
+  background: var(--button-bg);
+  color: var(--text-secondary);
+  font: 9px var(--font-mono);
+}
+
+.run-attempt-picker select:focus-visible {
+  border-color: var(--accent-hover);
+  box-shadow: 0 0 0 2px var(--button-focus-ring);
 }
 
 .run-console-tabs {
@@ -2143,6 +2187,78 @@ button > svg {
 .run-input-inspector article > p,
 .console-empty {
   color: var(--text-muted);
+}
+
+.run-prompt-inspector {
+  gap: 17px;
+}
+
+.prompt-snapshot-meta {
+  display: flex;
+  min-height: 26px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-disabled);
+  font: 9px var(--font-mono);
+}
+
+.prompt-snapshot-meta code,
+.prompt-snapshot-meta em {
+  display: inline-flex;
+  min-height: 23px;
+  align-items: center;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--button-bg) 76%, transparent);
+  color: var(--text-muted);
+  font: inherit;
+  font-style: normal;
+}
+
+.prompt-snapshot-meta em.redacted {
+  border-color: rgb(16 185 129 / 30%);
+  background: var(--success-soft);
+  color: var(--success-bright);
+}
+
+.prompt-snapshot-meta em.original {
+  border-color: rgb(245 158 11 / 30%);
+  background: var(--warning-soft);
+  color: var(--warning-bright);
+}
+
+.prompt-snapshot-meta em.legacy {
+  color: var(--text-muted);
+}
+
+.prompt-section-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.prompt-section-grid article {
+  min-width: 0;
+}
+
+.prompt-section-grid pre {
+  height: 100%;
+  max-height: 180px;
+}
+
+.run-prompt-inspector .prompt-rendered {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0d1524;
+}
+
+.run-prompt-inspector .prompt-rendered pre {
+  max-height: 360px;
+  border: 0;
+  border-radius: 0;
 }
 
 .run-input-inspector pre,
@@ -2238,6 +2354,71 @@ button > svg {
 .run-event.operator .event-type { color: var(--accent-hover); }
 .run-event.error .event-type { color: var(--danger-bright); }
 
+.trace-event.reasoning_summary .event-type,
+.trace-event.agent_message .event-type { color: var(--info-bright); }
+.trace-event.tool_started .event-type { color: var(--warning-bright); }
+.trace-event.tool_completed .event-type { color: var(--success-bright); }
+.trace-event.status .event-type { color: var(--text-muted); }
+.trace-event.error .event-type { color: var(--danger-bright); }
+
+.trace-event-content {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.trace-tool-name {
+  display: inline-flex;
+  margin-top: 5px;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--button-bg);
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.trace-omitted-note {
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.trace-event-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 7px;
+}
+
+.trace-event-meta span {
+  display: inline-flex;
+  min-height: 20px;
+  align-items: center;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--button-bg);
+  color: var(--text-muted);
+  font: 8px var(--font-mono);
+}
+
+.trace-event-meta span.success {
+  border-color: rgb(16 185 129 / 30%);
+  color: var(--success-bright);
+}
+
+.trace-event-meta span.failed {
+  border-color: rgb(239 68 68 / 30%);
+  color: var(--danger-bright);
+}
+
 .console-artifact {
   border-color: var(--border);
   border-radius: 6px;
@@ -2304,6 +2485,91 @@ button > svg {
 
 .diff-panel {
   background: var(--surface);
+}
+
+.run-result-inspector {
+  min-height: 100%;
+}
+
+.agent-result-section,
+.run-result-artifact-section {
+  padding: 22px;
+}
+
+.run-result-artifact-section {
+  border-top: 1px solid var(--border);
+}
+
+.run-result-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.run-result-heading h3 {
+  margin: 5px 0 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.run-result-heading > span {
+  display: inline-grid;
+  min-width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--button-bg);
+  color: var(--text-muted);
+  font: 9px var(--font-mono);
+}
+
+.final-response-flags {
+  margin-top: 6px;
+  color: var(--text-muted);
+  font: 9px var(--font-mono);
+}
+
+.agent-final-response {
+  padding: 15px 16px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0d1524;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.75;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.run-result-artifacts {
+  padding: 0;
+}
+
+.raw-artifact-details {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.raw-artifact-details summary {
+  padding: 12px 2px;
+  color: var(--text-muted);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.raw-artifact-details summary:focus-visible {
+  border-radius: 4px;
+  outline: 2px solid var(--accent-hover);
+  outline-offset: 2px;
+}
+
+.raw-artifact-details .code-surface {
+  margin-top: 2px;
 }
 
 .run-context-panel {
@@ -3688,6 +3954,16 @@ button > svg {
     overflow-x: auto;
   }
 
+  .prompt-section-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .agent-result-section,
+  .run-result-artifact-section {
+    padding-right: 16px;
+    padding-left: 16px;
+  }
+
   .view-artifacts .stats-row,
   .artifact-registry .stats-row {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -4521,10 +4797,18 @@ button > svg {
 :root[data-theme='light'] .app-shell .run-console > .run-history-rail-active,
 :root[data-theme='light'] .app-shell .launcher-empty,
 :root[data-theme='light'] .app-shell .run-input-inspector article,
+:root[data-theme='light'] .app-shell .agent-final-response,
 :root[data-theme='light'] .app-shell .code-surface,
 :root[data-theme='light'] .app-shell .artifact-card-meta,
 :root[data-theme='light'] .app-shell .artifact-detail-meta {
   background: #f8fafc;
+}
+
+:root[data-theme='light'] .app-shell .run-attempt-picker select,
+:root[data-theme='light'] .app-shell .prompt-snapshot-meta code,
+:root[data-theme='light'] .app-shell .prompt-snapshot-meta em,
+:root[data-theme='light'] .app-shell .trace-event-meta span {
+  background: var(--control-bg);
 }
 
 :root[data-theme='light'] .app-shell .workflow-launch-option,
@@ -5314,4 +5598,102 @@ button > svg {
   .app-shell :is(.ghost-btn, .run-btn, .reject-btn, .approve-btn, .danger-inline, .attachment-add, .toolbar-primary-action, .canvas-dock-primary):not(:disabled):active {
     transform: none;
   }
+}
+
+/* Live node activity + SSE indicators in the run workspace. */
+.run-node-activity {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 3px;
+  min-width: 0;
+  color: var(--text-muted);
+  font-size: 8px;
+  line-height: 1.4;
+}
+
+.run-node-activity-icon { flex: 0 0 auto; }
+
+.run-node-activity-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-node-activity i {
+  flex: 0 0 auto;
+  color: var(--text-disabled);
+  font: 8px var(--font-mono);
+  font-style: normal;
+}
+
+.run-live-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border: 1px solid rgb(16 185 129 / 40%);
+  border-radius: 999px;
+  background: var(--success-soft);
+  color: var(--success-bright);
+  font-size: 8px;
+  font-weight: 650;
+}
+
+.run-live-pill i { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+
+@keyframes trace-live-pulse { 50% { opacity: 0.35; } }
+
+.run-live-pill i,
+.trace-live-indicator.live i { animation: trace-live-pulse 1.6s ease-in-out infinite; }
+
+/* Trace tab: the list scrolls on its own so it can follow the newest event. */
+.run-trace-wrap { position: relative; display: flex; min-height: 0; height: 100%; flex-direction: column; }
+
+.run-trace-wrap .run-event-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+
+.trace-follow-button {
+  position: absolute;
+  right: 24px;
+  bottom: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--popover);
+  color: var(--text-secondary);
+  font-size: 10px;
+  cursor: pointer;
+  box-shadow: 0 10px 26px rgb(0 0 0 / 22%);
+}
+
+.trace-follow-button svg { width: 11px; height: 11px; }
+
+.trace-live-indicator {
+  position: absolute;
+  top: 10px;
+  right: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 9px;
+}
+
+.trace-live-indicator i { width: 6px; height: 6px; border-radius: 50%; background: var(--text-disabled); }
+
+.trace-live-indicator.live { border-color: rgb(16 185 129 / 40%); color: var(--success-bright); }
+
+.trace-live-indicator.live i { background: var(--success-bright); }
+
+@media (prefers-reduced-motion: reduce) {
+  .run-live-pill i,
+  .trace-live-indicator.live i { animation: none; }
 }

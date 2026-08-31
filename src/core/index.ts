@@ -90,11 +90,18 @@ export {
   startRun,
   steerRun,
   validateRunGraph,
+  type AgentPromptSnapshot,
+  type AgentTraceEvent,
   type RunEvent,
   type RunInput,
   type RunInputAttachment,
   type RunSnapshot,
   type WorkflowRunReference,
 } from '../run-manager'
+
+export {
+  subscribeRunEvents,
+  type RunChangedListener,
+} from '../run-events'
 
 export { schemaFor, validatePayload, type JsonSchema } from '../artifact-schema'

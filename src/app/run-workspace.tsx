@@ -1,16 +1,19 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type Ref } from 'react'
-import { AlertTriangle, ArrowLeft, Check, CirclePause, CirclePlay, Clock3, Copy, FileCode2, FileText, FolderOpen, GitBranch, ImagePlus, LoaderCircle, Package, Paperclip, Play, RotateCcw, Search, Send, Square, Terminal, Waypoints, X } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowLeft, Check, CirclePause, CirclePlay, Clock3, Copy, FileCode2, FileText, FolderOpen, GitBranch, ImagePlus, LoaderCircle, Package, Paperclip, Play, RotateCcw, Search, Send, Square, Terminal, Waypoints, X } from 'lucide-react'
 import { defaultRunMetricColumnWeights, minimumRunMetricColumnWidths, normalizeRunMetricColumnWeights, parseRunMetricColumnWeights, resizeRunMetricColumnPair, serializeRunMetricColumnWeights, type RunMetricColumnValues } from './run-metric-layout'
 import type { WorkflowRecordView } from './workflow-library'
 
 type CommandSpec = { command: string; cwd: string; timeoutMs: number }
 type PendingCommandApproval = { nodeId: string; commandKey: string; command: CommandSpec; requestedAt: string }
 type RunAttachment = { id: string; name: string; mediaType: string; byteLength: number; dataUrl?: string; sourceUrl?: string }
-type RunArtifact = { id: string; nodeId: string; type: string; version: number; schemaId: string; schemaVersion: number; status: 'valid' | 'awaiting_approval' | 'rejected' | 'invalid'; contentHash: string; inputArtifactIds: string[]; validationErrors: string[]; createdAt: string }
+type RunArtifact = { id: string; nodeId: string; attemptId?: string; type: string; version: number; schemaId: string; schemaVersion: number; status: 'valid' | 'awaiting_approval' | 'rejected' | 'invalid'; contentHash: string; inputArtifactIds: string[]; validationErrors: string[]; createdAt: string }
 type RunEvent = { id: string; occurredAt: string; type: 'run-created' | 'run-state' | 'node-state' | 'command' | 'executor' | 'artifact' | 'operator' | 'activity' | 'error'; message: string; nodeId?: string; attemptId?: string; details?: Record<string, string | number | boolean | null> }
-type RunAttempt = { id: string; attempt: number; executorId: string; status: string; startedAt: string; endedAt?: string; exitReason?: string; output?: string; inputArtifactIds?: string[] }
+type AgentPromptSnapshot = { schemaVersion?: 1; createdAt: string; contentHash: string; inputArtifactIds: string[]; renderedPrompt: string; runtimeInstruction: string; nodeInstruction: string; redacted: boolean }
+type AgentTraceKind = 'reasoning_summary' | 'agent_message' | 'tool_started' | 'tool_completed' | 'status' | 'error'
+type AgentTraceEvent = { schemaVersion?: 1; seq: number; occurredAt: string; executorId?: string; nodeId: string; attemptId: string; kind: AgentTraceKind; sourceEventId?: string; toolName?: string; content?: string; command?: string; status?: string; exitCode?: number; durationMs?: number; truncated?: boolean; redacted?: boolean }
+type RunAttempt = { id: string; attempt: number; executorId: string; status: string; startedAt: string; endedAt?: string; exitReason?: string; output?: string; inputArtifactIds?: string[]; promptSnapshot?: AgentPromptSnapshot; finalResponse?: string; finalResponseRedacted?: boolean; finalResponseTruncated?: boolean; trace?: AgentTraceEvent[]; traceOmittedCount?: number }
 type RunNode = { id: string; kind: string; executorId?: string; prompt?: string; outputType?: string; state: string; attempts: RunAttempt[] }
 export type RunWorkspaceRun = { id: string; status: string; startedAt: string; endedAt?: string; worktreePath?: string; branchName?: string; workflow?: { workflowId: string; workflowName: string; revision: number; publishedAt: string }; input: { text: string; attachments: RunAttachment[]; submittedAt?: string }; pendingCommandApproval?: PendingCommandApproval; nodes: RunNode[]; edges: Array<{ from: string; to: string }>; logs: string[]; events: RunEvent[]; artifacts: RunArtifact[] }
 
@@ -20,6 +23,10 @@ type RunPanelResizeKind = 'history-width' | 'context-width' | 'history-height'
 type RunPanelResizeState = { kind: RunPanelResizeKind; pointerId: number; startPosition: number; startSize: number }
 type RunPanelMaximums = { historyWidth: number; contextWidth: number; historyHeight: number }
 type RunMetricResizeState = { dividerIndex: number; pointerId: number; startX: number; startWidths: RunMetricColumnValues }
+type RunReviewTab = 'prompt' | 'trace' | 'result' | 'diff'
+type TimelineItem = { id: string; occurredAt: string; order: number; kind: AgentTraceKind | RunEvent['type']; label: string; title: string; toolName?: string; content?: string; command?: string; status?: string; exitCode?: number; durationMs?: number; truncated?: boolean; redacted?: boolean; details?: RunEvent['details'] }
+type LiveStatePayload = { status: string; startedAt?: string; endedAt?: string; pendingCommandApproval?: PendingCommandApproval | null; logs?: string[]; nodes?: Array<{ id: string; state: string; attempts?: Array<{ id: string; status: string; startedAt: string; endedAt?: string; exitReason?: string; output?: string; finalResponse?: string }> }> }
+type LiveTracePayload = { nodeId: string; attemptId: string; events: AgentTraceEvent[]; traceOmittedCount: number; full: boolean }
 
 const maxAttachmentCount = 12
 const maxAttachmentBytes = 8 * 1024 * 1024
@@ -48,6 +55,53 @@ function runStatusLabel(status: string) {
 
 function isActive(status: string) {
   return ['preparing', 'running', 'awaiting_approval', 'paused'].includes(status)
+}
+
+const liveTraceLimit = 300
+
+// Merges an SSE state payload into the locally cached run. Trace arrays and prompt
+// snapshots stay untouched here; only lifecycle fields are replaced.
+function applyLiveState(run: RunWorkspaceRun, payload: LiveStatePayload): RunWorkspaceRun {
+  return {
+    ...run,
+    status: payload.status ?? run.status,
+    ...(payload.endedAt === undefined ? {} : { endedAt: payload.endedAt }),
+    pendingCommandApproval: payload.pendingCommandApproval ?? undefined,
+    ...(Array.isArray(payload.logs) ? { logs: payload.logs } : {}),
+    nodes: run.nodes.map(node => {
+      const next = payload.nodes?.find(item => item.id === node.id)
+      if (!next) return node
+      return {
+        ...node,
+        state: next.state ?? node.state,
+        attempts: (next.attempts ?? node.attempts).map((nextAttempt, index) => {
+          const existing = node.attempts.find(attempt => attempt.id === nextAttempt.id)
+          if (existing) return { ...existing, ...nextAttempt, trace: existing.trace, traceOmittedCount: existing.traceOmittedCount }
+          return { id: nextAttempt.id, attempt: index + 1, executorId: node.executorId ?? 'codex', status: nextAttempt.status, startedAt: nextAttempt.startedAt, ...(nextAttempt.endedAt ? { endedAt: nextAttempt.endedAt } : {}), ...(nextAttempt.exitReason ? { exitReason: nextAttempt.exitReason } : {}), ...(nextAttempt.output ? { output: nextAttempt.output } : {}) }
+        }),
+      }
+    }),
+  }
+}
+
+function applyLiveTrace(run: RunWorkspaceRun, payload: LiveTracePayload): RunWorkspaceRun {
+  return {
+    ...run,
+    nodes: run.nodes.map(node => {
+      if (node.id !== payload.nodeId) return node
+      return {
+        ...node,
+        attempts: node.attempts.map(attempt => {
+          if (attempt.id !== payload.attemptId) return attempt
+          if (payload.full) return { ...attempt, trace: payload.events.slice(-liveTraceLimit), traceOmittedCount: payload.traceOmittedCount }
+          const existing = attempt.trace ?? []
+          const lastSeq = existing.at(-1)?.seq ?? 0
+          const merged = [...existing, ...payload.events.filter(event => event.seq > lastSeq)].slice(-liveTraceLimit)
+          return { ...attempt, trace: merged, traceOmittedCount: payload.traceOmittedCount }
+        }),
+      }
+    }),
+  }
 }
 
 function statusClass(status: string) {
@@ -265,7 +319,8 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([])
   const [referenceUrl, setReferenceUrl] = useState('')
   const [selectedNodeId, setSelectedNodeId] = useState('')
-  const [tab, setTab] = useState<'input' | 'activity' | 'artifacts' | 'diff'>('input')
+  const [selectedAttemptId, setSelectedAttemptId] = useState('')
+  const [tab, setTab] = useState<RunReviewTab>('prompt')
   const [artifactPayload, setArtifactPayload] = useState<{ id: string; payload: unknown } | null>(null)
   const [steeringNote, setSteeringNote] = useState('')
   const [notice, setNotice] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
@@ -274,12 +329,17 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   const copyTimerRef = useRef<number | null>(null)
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [logQuery, setLogQuery] = useState('')
+  const [liveConnected, setLiveConnected] = useState(false)
+  const [traceFollow, setTraceFollow] = useState(true)
+  const [, setClockTick] = useState(0)
   const [runHistoryWidth, setRunHistoryWidth] = useState(defaultRunHistoryWidth)
   const [runContextWidth, setRunContextWidth] = useState(defaultRunContextWidth)
   const [runHistoryHeight, setRunHistoryHeight] = useState(defaultRunHistoryHeight)
   const [runPanelMaximums, setRunPanelMaximums] = useState<RunPanelMaximums>({ historyWidth: maxRunHistoryWidth, contextWidth: maxRunContextWidth, historyHeight: maxRunHistoryHeight })
   const [panelResizing, setPanelResizing] = useState<RunPanelResizeKind | null>(null)
   const runConsoleRef = useRef<HTMLDivElement>(null)
+  const traceListRef = useRef<HTMLDivElement>(null)
+  const runsRef = useRef<RunWorkspaceRun[]>([])
   const runHistoryRailRef = useRef<HTMLElement>(null)
   const runHistoryListRef = useRef<HTMLDivElement>(null)
   const runContextPanelRef = useRef<HTMLElement>(null)
@@ -432,10 +492,50 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
       .catch(() => undefined)
   }, [])
 
-  useEffect(() => { loadRuns(); const timer = window.setInterval(loadRuns, 900); return () => window.clearInterval(timer) }, [loadRuns])
+  // While the selected run is active, its live data streams over SSE; the list poll then
+  // only refreshes run-list metadata and reconciles anything SSE cannot carry (artifacts).
+  useEffect(() => { loadRuns(); const timer = window.setInterval(loadRuns, liveConnected ? 4_000 : 900); return () => window.clearInterval(timer) }, [loadRuns, liveConnected])
+
+  useEffect(() => {
+    runsRef.current = runs
+  }, [runs])
+
+  useEffect(() => {
+    if (!selectedRun || !isActive(selectedRun.status)) { setLiveConnected(false); return }
+    const runId = selectedRun.id
+    const source = new EventSource(`/api/runs/${runId}/events`)
+    source.addEventListener('open', () => setLiveConnected(true))
+    source.addEventListener('state', event => {
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as LiveStatePayload
+        setRuns(current => current.map(run => run.id === runId ? applyLiveState(run, payload) : run))
+      } catch { /* malformed payloads are replaced by the next list poll */ }
+    })
+    source.addEventListener('trace', event => {
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as LiveTracePayload
+        setRuns(current => current.map(run => run.id === runId ? applyLiveTrace(run, payload) : run))
+      } catch { /* malformed payloads are replaced by the next list poll */ }
+    })
+    source.addEventListener('done', () => { setLiveConnected(false); source.close() })
+    source.addEventListener('error', () => setLiveConnected(false))
+    return () => { source.close(); setLiveConnected(false) }
+  }, [selectedRun?.id, selectedRun?.status])
+  useEffect(() => {
+    if (!selectedRun || !isActive(selectedRun.status)) return
+    const timer = window.setInterval(() => setClockTick(value => value + 1), 1_000)
+    return () => window.clearInterval(timer)
+  }, [selectedRun?.id, selectedRun?.status])
   useEffect(() => { if (!workflowId && publishedWorkflows[0]) setWorkflowId(publishedWorkflows[0].id) }, [publishedWorkflows, workflowId])
   useEffect(() => { if (selectedRun && !selectedRun.nodes.some(node => node.id === selectedNodeId)) setSelectedNodeId(selectedRun.nodes[0]?.id ?? '') }, [selectedNodeId, selectedRun])
-  useEffect(() => { setArtifactPayload(null); setTab('input') }, [selectedNodeId, selectedRunId])
+  useEffect(() => {
+    setArtifactPayload(null); setSelectedAttemptId(''); setTraceFollow(true)
+    // Running attempts open on the live trace; finished ones open on the result.
+    const run = runsRef.current.find(item => item.id === selectedRunId)
+    const node = run?.nodes.find(item => item.id === selectedNodeId) ?? run?.nodes[0]
+    const attempt = node?.attempts.at(-1)
+    setTab(attempt?.status === 'running' ? 'trace' : attempt?.status === 'succeeded' || attempt?.status === 'failed' ? 'result' : 'prompt')
+  }, [selectedNodeId, selectedRunId])
   useEffect(() => { setLogQuery('') }, [selectedRunId])
   useEffect(() => { onRunContextChange?.(selectedRunContext) }, [onRunContextChange, selectedRunContext])
   useEffect(() => () => { onRunContextChange?.(null) }, [onRunContextChange])
@@ -550,21 +650,28 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
       const response = await fetch(`/api/runs/${selectedRun.id}/artifacts/${artifact.id}`)
       if (!response.ok) throw new Error('无法读取此产物。')
       setArtifactPayload({ id: artifact.id, payload: await response.json() })
-      setTab(artifact.type === 'code-diff' ? 'diff' : 'artifacts')
+      setTab(artifact.type === 'code-diff' ? 'diff' : 'result')
     } catch (error) {
       setNotice({ kind: 'error', text: error instanceof Error ? error.message : '无法读取此产物。' })
     } finally { setBusy(null) }
   }
 
   const showWorktree = async () => { if (selectedRun?.worktreePath) await window.artifactDesktop?.showItem(selectedRun.worktreePath) }
-  const selectedArtifacts = useMemo(() => selectedRun && selectedNode ? selectedRun.artifacts.filter(artifact => artifact.nodeId === selectedNode.id) : [], [selectedNode, selectedRun])
-  const selectedEvents = useMemo(() => selectedRun ? selectedRun.events.filter(event => !selectedNode || !event.nodeId || event.nodeId === selectedNode.id).slice().reverse() : [], [selectedNode, selectedRun])
-  const selectedDiff = useMemo(() => selectedArtifacts.find(artifact => artifact.type === 'code-diff') ?? null, [selectedArtifacts])
+  const selectedAttempt = useMemo(() => selectedNode?.attempts.find(attempt => attempt.id === selectedAttemptId) ?? selectedNode?.attempts.at(-1) ?? null, [selectedAttemptId, selectedNode])
+  const selectedArtifacts = useMemo(() => selectedRun && selectedNode ? selectedRun.artifacts.filter(artifact => artifact.nodeId === selectedNode.id && (!artifact.attemptId || artifact.attemptId === selectedAttempt?.id)) : [], [selectedAttempt?.id, selectedNode, selectedRun])
+  const selectedTimeline = useMemo(() => buildAttemptTimeline(selectedRun, selectedNode, selectedAttempt), [selectedAttempt, selectedNode, selectedRun])
+  const selectedDiff = useMemo(() => selectedArtifacts.filter(artifact => artifact.type === 'code-diff').at(-1) ?? null, [selectedArtifacts])
+  const latestResultArtifact = useMemo(() => selectedArtifacts.filter(artifact => artifact.type !== 'code-diff').at(-1) ?? null, [selectedArtifacts])
+  const openedArtifact = useMemo(() => selectedArtifacts.find(artifact => artifact.id === artifactPayload?.id) ?? null, [artifactPayload?.id, selectedArtifacts])
   const completedNodeCount = selectedRun?.nodes.filter(node => ['success', 'failed', 'cancelled', 'skipped'].includes(node.state)).length ?? 0
   const runProgress = selectedRun?.nodes.length ? Math.round((completedNodeCount / selectedRun.nodes.length) * 100) : 0
-  const selectedAttempt = selectedNode?.attempts.at(-1)
   const artifactPayloadText = artifactPayload ? JSON.stringify(artifactPayload.payload, null, 2) : ''
   const diffPayloadText = artifactPayload && artifactPayload.id === selectedDiff?.id ? payloadContent(artifactPayload.payload) : ''
+  const finalResponse = selectedAttempt?.finalResponse?.trim() || (artifactPayload && openedArtifact?.type !== 'code-diff' ? payloadContent(artifactPayload.payload) : '')
+  const promptSnapshot = selectedAttempt?.promptSnapshot
+  const promptInputArtifactIds = promptSnapshot?.inputArtifactIds ?? selectedAttempt?.inputArtifactIds ?? []
+  const publicNodeInstruction = promptSnapshot?.nodeInstruction || (selectedNode?.kind === 'Agent' ? '该 Attempt 没有可公开展示的节点指令快照。' : selectedNode?.prompt || '该节点没有单独的指令。')
+  const renderedPrompt = promptSnapshot?.renderedPrompt ?? ''
   const filteredLogs = useMemo(() => {
     const logs = selectedRun?.logs ?? []
     const query = logQuery.trim().toLocaleLowerCase()
@@ -572,6 +679,31 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   }, [logQuery, selectedRun?.logs])
   const visibleLogs = filteredLogs.slice(0, 250)
   const logText = visibleLogs.join('\n')
+
+  // Follow the newest trace line while the attempt runs; a manual scroll up pauses it.
+  useEffect(() => {
+    if (tab !== 'trace' || !traceFollow) return
+    const element = traceListRef.current
+    if (element) element.scrollTop = element.scrollHeight
+  }, [selectedTimeline.length, tab, traceFollow])
+
+  const handleTraceScroll = () => {
+    const element = traceListRef.current
+    if (!element) return
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight
+    setTraceFollow(distance <= 40)
+  }
+
+  const jumpToLatestTrace = () => {
+    setTraceFollow(true)
+    const element = traceListRef.current
+    if (element) element.scrollTop = element.scrollHeight
+  }
+
+  useEffect(() => {
+    if (tab !== 'result' || selectedAttempt?.finalResponse?.trim() || !latestResultArtifact || artifactPayload) return
+    void openArtifact(latestResultArtifact)
+  }, [artifactPayload, latestResultArtifact?.id, selectedAttempt?.finalResponse, selectedAttempt?.id, tab])
 
   const copyText = async (value: string, key: string) => {
     if (!value) return
@@ -615,14 +747,76 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
       <div ref={runConsoleRef} className="run-console" data-resizing={panelResizing ?? undefined} style={{ '--run-history-width': `${runHistoryWidth}px`, '--run-context-width': `${runContextWidth}px` } as CSSProperties}>
         <RunHistoryRail runs={runs} selectedRunId={selectedRunId} onSelect={setSelectedRunId} className="run-history-rail-active" panelId="run-history-panel" listId="run-history-list" panelRef={runHistoryRailRef} listRef={runHistoryListRef} listStyle={{ flexBasis: runHistoryHeight, maxHeight: runHistoryHeight }}>
           <button className="run-history-splitter" type="button" role="separator" aria-label="调整最近运行与当前步骤的高度" aria-orientation="horizontal" aria-controls="run-history-list run-steps-panel" aria-valuemin={minRunHistoryHeight} aria-valuemax={runPanelMaximums.historyHeight} aria-valuenow={Math.min(runHistoryHeight, runPanelMaximums.historyHeight)} title="拖动调整上下区域；双击恢复默认" onPointerDown={event => startRunPanelResize('history-height', event)} onPointerMove={resizeRunPanel} onPointerUp={finishRunPanelResize} onPointerCancel={finishRunPanelResize} onLostPointerCapture={finishRunPanelResize} onKeyDown={event => adjustRunPanelSize('history-height', event)} onDoubleClick={() => commitRunPanelSize('history-height', defaultRunHistoryHeight)} />
-          <section id="run-steps-panel" className="run-history-steps" aria-label="当前运行步骤"><div className="run-console-rail-heading"><span className="section-kicker">STEPS</span><span className={`run-status-pill ${statusClass(selectedRun.status)}`}><i className="status-pill-dot" />{runStatusLabel(selectedRun.status)}</span></div><div className="run-node-list">{selectedRun.nodes.map((node, index) => <button key={node.id} className={`run-node-item ${node.id === selectedNode?.id ? 'selected' : ''}`} aria-current={node.id === selectedNode?.id ? 'step' : undefined} onClick={() => setSelectedNodeId(node.id)}><span className={`run-node-state ${statusClass(node.state)}`}>{index + 1}</span><span className="run-node-copy"><b title={node.id}>{node.id}</b><small>{stateLabel(node.state)} · {node.attempts.length} Attempt{node.attempts.length === 1 ? '' : 's'}</small><em title={node.outputType ?? 'artifact'}><Terminal aria-hidden="true" />{node.outputType ?? 'artifact'}</em></span></button>)}</div><div className="run-rail-actions">{isActive(selectedRun.status) && selectedRun.status !== 'paused' && <button className="ghost-btn" disabled={Boolean(busy)} onClick={() => void runAction('pause', selectedNode ? { nodeId: selectedNode.id } : {})}><CirclePause aria-hidden="true" />暂停</button>}{selectedRun.status === 'paused' && <button className="run-btn" disabled={Boolean(busy)} onClick={() => void runAction('resume')}><CirclePlay aria-hidden="true" />继续</button>}{!['succeeded', 'failed', 'cancelled'].includes(selectedRun.status) && <button className="danger-inline" disabled={Boolean(busy)} onClick={() => void runAction('cancel')}><Square aria-hidden="true" />取消</button>}</div></section>
+          <section id="run-steps-panel" className="run-history-steps" aria-label="当前运行步骤"><div className="run-console-rail-heading"><span className="section-kicker">STEPS</span><span className={`run-status-pill ${statusClass(selectedRun.status)}`}><i className="status-pill-dot" />{runStatusLabel(selectedRun.status)}</span>{liveConnected && <span className="run-live-pill" title="运行数据通过 SSE 实时推送"><i aria-hidden="true" />实时</span>}</div><div className="run-node-list">{selectedRun.nodes.map((node, index) => <button key={node.id} className={`run-node-item ${node.id === selectedNode?.id ? 'selected' : ''}`} aria-current={node.id === selectedNode?.id ? 'step' : undefined} onClick={() => setSelectedNodeId(node.id)}><span className={`run-node-state ${statusClass(node.state)}`}>{index + 1}</span><span className="run-node-copy"><b title={node.id}>{node.id}</b><small>{stateLabel(node.state)} · {node.attempts.length} Attempt{node.attempts.length === 1 ? '' : 's'}</small><RunNodeActivity node={node} /><em title={node.outputType ?? 'artifact'}><Terminal aria-hidden="true" />{node.outputType ?? 'artifact'}</em></span></button>)}</div><div className="run-rail-actions">{isActive(selectedRun.status) && selectedRun.status !== 'paused' && <button className="ghost-btn" disabled={Boolean(busy)} onClick={() => void runAction('pause', selectedNode ? { nodeId: selectedNode.id } : {})}><CirclePause aria-hidden="true" />暂停</button>}{selectedRun.status === 'paused' && <button className="run-btn" disabled={Boolean(busy)} onClick={() => void runAction('resume')}><CirclePlay aria-hidden="true" />继续</button>}{!['succeeded', 'failed', 'cancelled'].includes(selectedRun.status) && <button className="danger-inline" disabled={Boolean(busy)} onClick={() => void runAction('cancel')}><Square aria-hidden="true" />取消</button>}</div></section>
         </RunHistoryRail>
         <button className="run-panel-resizer run-panel-resizer-left" type="button" role="separator" aria-label="调整运行历史栏宽度" aria-orientation="vertical" aria-controls="run-history-panel run-review-panel" aria-valuemin={minRunHistoryWidth} aria-valuemax={runPanelMaximums.historyWidth} aria-valuenow={Math.min(runHistoryWidth, runPanelMaximums.historyWidth)} title="拖动调整运行历史栏；双击恢复默认" onPointerDown={event => startRunPanelResize('history-width', event)} onPointerMove={resizeRunPanel} onPointerUp={finishRunPanelResize} onPointerCancel={finishRunPanelResize} onLostPointerCapture={finishRunPanelResize} onKeyDown={event => adjustRunPanelSize('history-width', event)} onDoubleClick={() => commitRunPanelSize('history-width', defaultRunHistoryWidth)} />
-        <main id="run-review-panel" className="run-console-main"><header className="run-console-main-heading"><div><span className="section-kicker">{selectedNode?.kind ?? 'RUN'}</span><h2 title={selectedNode?.id}>{selectedNode?.id ?? '选择节点'}</h2><p title={selectedNode?.prompt}>{selectedNode?.prompt || '该节点没有单独的指令。'}</p>{selectedAttempt && <small className="run-attempt-context">Attempt {selectedAttempt.attempt} · {selectedAttempt.executorId} · {stateLabel(selectedAttempt.status)}</small>}</div><div className="run-console-tabs" role="tablist" aria-label="运行审查视图"><button id="run-tab-input" role="tab" aria-selected={tab === 'input'} aria-controls="run-tabpanel" className={tab === 'input' ? 'active' : ''} onClick={() => setTab('input')}>输入</button><button id="run-tab-activity" role="tab" aria-selected={tab === 'activity'} aria-controls="run-tabpanel" className={tab === 'activity' ? 'active' : ''} onClick={() => setTab('activity')}>活动 <span>{selectedEvents.length}</span></button><button id="run-tab-artifacts" role="tab" aria-selected={tab === 'artifacts'} aria-controls="run-tabpanel" className={tab === 'artifacts' ? 'active' : ''} onClick={() => setTab('artifacts')}>产物 <span>{selectedArtifacts.length}</span></button><button id="run-tab-diff" role="tab" aria-selected={tab === 'diff'} aria-controls="run-tabpanel" className={tab === 'diff' ? 'active' : ''} onClick={() => setTab('diff')} disabled={!selectedDiff}>Diff</button></div></header>
+        <main id="run-review-panel" className="run-console-main">
+          <header className="run-console-main-heading">
+            <div>
+              <span className="section-kicker">{selectedNode?.kind ?? 'RUN'}</span>
+              <h2 title={selectedNode?.id}>{selectedNode?.id ?? '选择节点'}</h2>
+              <p title={publicNodeInstruction}>{publicNodeInstruction}</p>
+              {selectedNode?.attempts.length ? <div className="run-attempt-row">
+                <label className="run-attempt-picker">
+                  <span>Attempt</span>
+                  <select aria-label="选择执行尝试" value={selectedAttempt?.id ?? ''} onChange={event => {
+                    const nextAttempt = selectedNode.attempts.find(attempt => attempt.id === event.target.value)
+                    setSelectedAttemptId(event.target.value)
+                    setArtifactPayload(null)
+                    setTraceFollow(true)
+                    setTab(nextAttempt?.status === 'running' ? 'trace' : nextAttempt?.status === 'succeeded' || nextAttempt?.status === 'failed' ? 'result' : 'prompt')
+                  }}>
+                    {selectedNode.attempts.map(attempt => <option key={attempt.id} value={attempt.id}>Attempt {attempt.attempt} · {stateLabel(attempt.status)}</option>)}
+                  </select>
+                </label>
+                {selectedAttempt && <small className="run-attempt-context">{selectedAttempt.executorId} · {formatDuration(selectedAttempt.startedAt, selectedAttempt.endedAt)}</small>}
+              </div> : null}
+            </div>
+            <div className="run-console-tabs" role="tablist" aria-label="运行审查视图">
+              <button id="run-tab-prompt" role="tab" aria-selected={tab === 'prompt'} aria-controls="run-tabpanel" className={tab === 'prompt' ? 'active' : ''} onClick={() => setTab('prompt')}>发送内容</button>
+              <button id="run-tab-trace" role="tab" aria-selected={tab === 'trace'} aria-controls="run-tabpanel" className={tab === 'trace' ? 'active' : ''} onClick={() => setTab('trace')}>执行过程 <span>{selectedTimeline.length}</span></button>
+              <button id="run-tab-result" role="tab" aria-selected={tab === 'result'} aria-controls="run-tabpanel" className={tab === 'result' ? 'active' : ''} onClick={() => setTab('result')}>结果 <span>{selectedArtifacts.length}</span></button>
+              <button id="run-tab-diff" role="tab" aria-selected={tab === 'diff'} aria-controls="run-tabpanel" className={tab === 'diff' ? 'active' : ''} onClick={() => setTab('diff')} disabled={!selectedDiff}>代码变更</button>
+            </div>
+          </header>
           <section id="run-tabpanel" className="run-console-content" role="tabpanel" aria-labelledby={`run-tab-${tab}`}>
-            {tab === 'input' && <div className="run-input-inspector"><article><div className="code-surface-heading"><span>运行需求</span><button className="run-copy-button" title="复制运行需求" aria-label="复制运行需求" onClick={() => void copyText(selectedRun.input.text, 'input')}>{copiedKey === 'input' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></div><pre>{selectedRun.input.text || '未提交文字需求。'}</pre></article><article><span>冻结附件</span>{selectedRun.input.attachments.length ? <div className="console-attachment-list">{selectedRun.input.attachments.map(attachment => <div key={attachment.id}><Paperclip aria-hidden="true" /><span title={attachment.name}>{attachment.name}</span><small>{attachment.sourceUrl ?? `${attachment.mediaType} · ${formatBytes(attachment.byteLength)}`}</small></div>)}</div> : <p>没有附件。</p>}</article>{selectedNode?.attempts.at(-1)?.inputArtifactIds?.length ? <article><span>本次 Attempt 使用的上游 Artifact</span><div className="artifact-id-list">{selectedNode.attempts.at(-1)?.inputArtifactIds?.map(id => <code key={id} title={id}>{id}</code>)}</div></article> : null}</div>}
-            {tab === 'activity' && <div className="run-event-list">{selectedEvents.length ? selectedEvents.map(event => <article key={event.id} className={`run-event ${event.type}`}><span className="event-time">{new Date(event.occurredAt).toLocaleTimeString('zh-CN', { hour12: false })}</span><span className="event-type">{eventTypeLabel(event.type)}</span><div><b>{event.message}</b>{event.details && <pre>{Object.entries(event.details).map(([key, value]) => `${key}: ${String(value)}`).join('\n')}</pre>}</div></article>) : <p className="console-empty">该节点尚未产生可公开展示的活动。</p>}</div>}
-            {tab === 'artifacts' && <div className="console-artifact-list">{selectedArtifacts.length ? selectedArtifacts.map(artifact => <button key={artifact.id} className={`console-artifact ${artifactPayload?.id === artifact.id ? 'selected' : ''}`} title={`${artifact.schemaId} v${artifact.schemaVersion}`} onClick={() => void openArtifact(artifact)}><span className="console-artifact-icon"><FileText aria-hidden="true" /></span><span><b>{artifact.type} v{artifact.version}</b><small>{artifact.schemaId} · {new Date(artifact.createdAt).toLocaleTimeString('zh-CN')}</small></span><em className={statusClass(artifact.status)}>{artifact.status}</em></button>) : <p className="console-empty">该节点尚未生成 Artifact。</p>}{artifactPayload && <div className="code-surface"><div className="code-surface-heading"><span>Artifact payload</span><button className="run-copy-button" title="复制产物内容" aria-label="复制产物内容" onClick={() => void copyText(artifactPayloadText, 'artifact')}>{copiedKey === 'artifact' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></div><pre className="artifact-payload">{artifactPayloadText}</pre></div>}</div>}
+            {tab === 'prompt' && <div className="run-input-inspector run-prompt-inspector">
+              <div className="prompt-snapshot-meta">
+                {promptSnapshot ? <>
+                  <span>{new Date(promptSnapshot.createdAt).toLocaleString('zh-CN', { hour12: false })}</span>
+                  <code title={promptSnapshot.contentHash}>SHA-256 {promptSnapshot.contentHash.slice(0, 12)}</code>
+                  <em className={promptSnapshot.redacted ? 'redacted' : 'original'}>{promptSnapshot.redacted ? '已脱敏' : '无需脱敏'}</em>
+                </> : <em className="legacy">旧 Run 未保存完整发送快照</em>}
+              </div>
+              <div className="prompt-section-grid">
+                <article><span>运行时约束</span><pre>{promptSnapshot?.runtimeInstruction || '此 Attempt 未记录运行时约束。'}</pre></article>
+                <article><span>节点指令</span><pre>{publicNodeInstruction}</pre></article>
+              </div>
+              <article className="prompt-rendered"><div className="code-surface-heading"><span>{promptSnapshot ? '最终发送给 Agent' : '可回放输入'}</span><button className="run-copy-button" title="复制发送内容" aria-label="复制发送内容" disabled={!renderedPrompt} onClick={() => void copyText(renderedPrompt, 'prompt')}>{copiedKey === 'prompt' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></div><pre>{renderedPrompt || '该 Attempt 没有可回放的发送内容。'}</pre></article>
+              <article><div className="code-surface-heading"><span>运行需求</span><button className="run-copy-button" title="复制运行需求" aria-label="复制运行需求" onClick={() => void copyText(selectedRun.input.text, 'input')}>{copiedKey === 'input' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></div><pre>{selectedRun.input.text || '未提交文字需求。'}</pre></article>
+              {promptInputArtifactIds.length ? <article><span>本次 Attempt 使用的上游 Artifact</span><div className="artifact-id-list">{promptInputArtifactIds.map(id => <code key={id} title={id}>{id}</code>)}</div></article> : null}
+              <article><span>冻结附件</span>{selectedRun.input.attachments.length ? <div className="console-attachment-list">{selectedRun.input.attachments.map(attachment => <div key={attachment.id}><Paperclip aria-hidden="true" /><span title={attachment.name}>{attachment.name}</span><small>{attachment.sourceUrl ?? `${attachment.mediaType} · ${formatBytes(attachment.byteLength)}`}</small></div>)}</div> : <p>没有附件。</p>}</article>
+            </div>}
+            {tab === 'trace' && <div className="run-trace-wrap">
+              <div ref={traceListRef} onScroll={handleTraceScroll} className="run-event-list run-trace-list">{selectedAttempt?.traceOmittedCount ? <p className="trace-omitted-note">为控制回放体积，未展示较早的 {selectedAttempt.traceOmittedCount} 条记录。</p> : null}{selectedTimeline.length ? selectedTimeline.map(event => <article key={event.id} className={`run-event trace-event ${event.kind}`}>
+              <span className="event-time">{new Date(event.occurredAt).toLocaleTimeString('zh-CN', { hour12: false })}</span>
+              <span className="event-type">{event.label}</span>
+              <div><b>{event.title}</b>{event.toolName && <code className="trace-tool-name">{event.toolName}</code>}{event.content && <p className="trace-event-content">{event.content}</p>}{event.command && <pre>$ {event.command}</pre>}{event.details && <pre>{Object.entries(event.details).map(([key, value]) => `${key}: ${String(value)}`).join('\n')}</pre>}{(event.status !== undefined || event.exitCode !== undefined || event.durationMs !== undefined || event.truncated || event.redacted) && <div className="trace-event-meta">{event.status !== undefined && <span>{event.status}</span>}{event.exitCode !== undefined && <span className={event.exitCode === 0 ? 'success' : 'failed'}>退出码 {event.exitCode}</span>}{event.durationMs !== undefined && <span>{formatTraceDuration(event.durationMs)}</span>}{event.redacted && <span>敏感信息已脱敏</span>}{event.truncated && <span>内容已截断</span>}</div>}</div>
+            </article>) : <p className="console-empty">该 Attempt 尚未产生可公开展示的执行记录。</p>}</div>
+              {selectedAttempt?.status === 'running' && !traceFollow && <button className="trace-follow-button" onClick={jumpToLatestTrace}><ArrowDown aria-hidden="true" />回到最新</button>}
+              {selectedAttempt?.status === 'running' && <span className={`trace-live-indicator ${liveConnected ? 'live' : ''}`}><i aria-hidden="true" />{liveConnected ? '实时' : '同步中'}</span>}
+            </div>}
+            {tab === 'result' && <div className="run-result-inspector">
+              <section className="agent-result-section">
+                <div className="run-result-heading"><div><span className="section-kicker">FINAL RESPONSE</span><h3>Agent 最终回复</h3>{selectedAttempt?.finalResponseRedacted || selectedAttempt?.finalResponseTruncated ? <span className="final-response-flags">{selectedAttempt.finalResponseRedacted && '已脱敏'}{selectedAttempt.finalResponseTruncated && '已截断'}</span> : null}</div><button className="run-copy-button" title="复制最终回复" aria-label="复制最终回复" disabled={!finalResponse} onClick={() => void copyText(finalResponse, 'result')}>{copiedKey === 'result' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></div>
+                {finalResponse ? <div className="agent-final-response">{finalResponse}</div> : <p className="console-empty">{selectedAttempt?.status === 'running' ? 'Agent 正在执行，完成后将在这里显示最终回复。' : '该 Attempt 没有保存最终回复。'}</p>}
+              </section>
+              <section className="run-result-artifact-section">
+                <div className="run-result-heading"><div><span className="section-kicker">ARTIFACTS</span><h3>关联产物</h3></div><span>{selectedArtifacts.length}</span></div>
+                {selectedArtifacts.length ? <div className="console-artifact-list run-result-artifacts">{selectedArtifacts.map(artifact => <button key={artifact.id} className={`console-artifact ${artifactPayload?.id === artifact.id ? 'selected' : ''}`} title={`${artifact.schemaId} v${artifact.schemaVersion}`} disabled={busy === `artifact:${artifact.id}`} onClick={() => void openArtifact(artifact)}><span className="console-artifact-icon"><FileText aria-hidden="true" /></span><span><b>{artifact.type} v{artifact.version}</b><small>{artifact.schemaId} · {new Date(artifact.createdAt).toLocaleTimeString('zh-CN')}</small></span><em className={statusClass(artifact.status)}>{artifact.status}</em></button>)}</div> : <p className="console-empty">该节点尚未生成 Artifact。</p>}
+                {artifactPayload && <details className="raw-artifact-details"><summary>查看所选 Artifact 原始数据</summary><div className="code-surface"><div className="code-surface-heading"><span>Artifact payload</span><button className="run-copy-button" title="复制产物内容" aria-label="复制产物内容" onClick={() => void copyText(artifactPayloadText, 'artifact')}>{copiedKey === 'artifact' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></div><pre className="artifact-payload">{artifactPayloadText}</pre></div></details>}
+              </section>
+            </div>}
             {tab === 'diff' && <div className="diff-panel">{selectedDiff ? <>{artifactPayload?.id !== selectedDiff.id && <button className="ghost-btn" onClick={() => void openArtifact(selectedDiff)}><FileCode2 aria-hidden="true" />读取代码 Diff</button>}{artifactPayload?.id === selectedDiff.id && <div className="code-surface"><div className="code-surface-heading"><span>代码 Diff</span><button className="run-copy-button" title="复制代码 Diff" aria-label="复制代码 Diff" onClick={() => void copyText(diffPayloadText, 'diff')}>{copiedKey === 'diff' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></div><pre>{diffPayloadText}</pre></div>}</> : <p className="console-empty">此节点没有代码 Diff。代码 Agent 完成修改后会在这里生成可审核内容。</p>}</div>}
           </section>
         </main>
@@ -637,8 +831,123 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   </section>
 }
 
+// One-line live summary of what a running node is doing right now, derived from the
+// attempt's latest public trace event (thinking, tool call, command, or heartbeat).
+function RunNodeActivity({ node }: { node: RunNode }) {
+  if (node.state !== 'running') return null
+  const attempt = node.attempts.at(-1)
+  const activity = latestActivity(attempt)
+  const startedAt = attempt?.startedAt
+  if (!startedAt) return null
+  return <small className="run-node-activity">
+    <span className="run-node-activity-icon" aria-hidden="true">{activity.icon}</span>
+    <span className="run-node-activity-text" title={activity.label}>{activity.label}</span>
+    <i>{formatDuration(startedAt)} · {sinceLabel(attempt?.trace?.at(-1)?.occurredAt ?? startedAt)}</i>
+  </small>
+}
+
+/** Shared one-line activity summary for running nodes in list and canvas views. */
+export function latestActivity(attempt: { trace?: Array<{ kind?: string; toolName?: string; content?: string; command?: string }> } | undefined): { icon: string; label: string } {
+  const event = attempt?.trace?.at(-1)
+  if (!event) return { icon: '◷', label: '已派发到执行器，等待输出…' }
+  const icon = activityIcon(event.kind as AgentTraceKind | undefined)
+  if (event.kind === 'tool_started' || event.kind === 'tool_completed') {
+    const detail = event.command ?? event.content
+    return { icon, label: `${event.toolName ?? 'tool'}${detail ? ` · ${compressActivityText(detail)}` : ''}` }
+  }
+  return { icon, label: compressActivityText(event.content ?? traceKindTitle(event.kind as AgentTraceKind) ?? '执行中…') }
+}
+
+function activityIcon(kind: AgentTraceKind | undefined) {
+  return ({ reasoning_summary: '💭', agent_message: '✉', tool_started: '🔧', tool_completed: '✓', status: '◷', error: '⚠' })[kind ?? 'status'] ?? '◷'
+}
+
+function activityTitle(event: AgentTraceEvent | undefined) {
+  if (!event) return '已派发到执行器，等待输出…'
+  if (event.kind === 'tool_started' || event.kind === 'tool_completed') {
+    const detail = event.command ?? event.content
+    return `${event.toolName ?? 'tool'}${detail ? ` · ${compressActivityText(detail)}` : ''}`
+  }
+  return compressActivityText(event.content ?? traceKindTitle(event.kind))
+}
+
+function compressActivityText(value: string) {
+  const single = value.replace(/\s+/g, ' ').trim()
+  return single.length > 72 ? `${single.slice(0, 72)}…` : single
+}
+
+function sinceLabel(occurredAt: string) {
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(occurredAt)) / 1000))
+  if (!Number.isFinite(seconds)) return ''
+  if (seconds < 60) return `${seconds}s 前`
+  return `${Math.floor(seconds / 60)}m 前`
+}
+
+function buildAttemptTimeline(run: RunWorkspaceRun | null, node: RunNode | null, attempt: RunAttempt | null): TimelineItem[] {
+  if (!run || !node || !attempt) return []
+  const trace = (attempt.trace ?? []).filter(event => (!event.nodeId || event.nodeId === node.id) && (!event.attemptId || event.attemptId === attempt.id))
+  if (trace.length) {
+    return trace.map(event => ({
+      id: `${attempt.id}-trace-${event.seq}`,
+      occurredAt: event.occurredAt,
+      order: event.seq,
+      kind: event.kind,
+      label: traceKindLabel(event.kind),
+      title: traceKindTitle(event.kind),
+      toolName: event.toolName,
+      content: event.content,
+      command: event.command,
+      status: event.status,
+      exitCode: event.exitCode,
+      durationMs: event.durationMs,
+      truncated: event.truncated,
+      redacted: event.redacted,
+    })).sort(compareTimelineItems)
+  }
+
+  return run.events.filter(event => {
+    if (event.attemptId) return event.attemptId === attempt.id && (!event.nodeId || event.nodeId === node.id)
+    return node.attempts.length === 1 && event.nodeId === node.id
+  }).map((event, index) => {
+    const details = event.details ? { ...event.details } : undefined
+    const content = typeof details?.text === 'string' ? details.text : undefined
+    if (details && 'text' in details) delete details.text
+    return {
+      id: event.id,
+      occurredAt: event.occurredAt,
+      order: index,
+      kind: event.type,
+      label: eventTypeLabel(event.type),
+      title: event.message,
+      content,
+      details: details && Object.keys(details).length ? details : undefined,
+    }
+  }).sort(compareTimelineItems)
+}
+
+function compareTimelineItems(left: TimelineItem, right: TimelineItem) {
+  const leftTime = Date.parse(left.occurredAt)
+  const rightTime = Date.parse(right.occurredAt)
+  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime
+  return left.order - right.order
+}
+
+function traceKindLabel(kind: AgentTraceKind) {
+  return ({ reasoning_summary: '决策摘要', agent_message: 'Agent 消息', tool_started: '工具开始', tool_completed: '工具完成', status: '状态', error: '错误' })[kind]
+}
+
+function traceKindTitle(kind: AgentTraceKind) {
+  return ({ reasoning_summary: 'Agent 更新了决策摘要', agent_message: 'Agent 公开说明', tool_started: '开始执行工具', tool_completed: '工具执行完成', status: '执行状态更新', error: '执行发生错误' })[kind]
+}
+
 function eventTypeLabel(type: RunEvent['type']) {
   return ({ 'run-created': '运行', 'run-state': '状态', 'node-state': '节点', command: '命令', executor: '执行器', artifact: '产物', operator: '操作员', activity: '活动', error: '错误' })[type]
+}
+
+function formatTraceDuration(durationMs: number) {
+  if (durationMs < 1_000) return `${Math.round(durationMs)}ms`
+  if (durationMs < 60_000) return `${(durationMs / 1_000).toFixed(durationMs < 10_000 ? 1 : 0)}s`
+  return `${Math.floor(durationMs / 60_000)}m ${Math.round((durationMs % 60_000) / 1_000)}s`
 }
 
 function formatBytes(bytes: number) {
