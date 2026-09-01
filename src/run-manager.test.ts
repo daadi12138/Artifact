@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { importProject, loadProject } from './project'
 import { saveExecutorConfigs } from './executor-config'
-import { approveRun, configureRunManagerForTests, getRun, pauseRun, resumeInterruptedRuns, resumeRun, retryRun, startRun, steerRun, validateRunGraph } from './run-manager'
+import { approveRun, configureRunManagerForTests, getRun, pauseRun, requestDeliveryApproval, resumeInterruptedRuns, resumeRun, retryRun, startRun, steerRun, validateRunGraph } from './run-manager'
 
 const execFileAsync = promisify(execFile)
 
@@ -23,6 +23,46 @@ test('run graph rejects invalid dependencies before execution', () => {
   assert.throws(() => validateRunGraph([{ id: 'input', kind: '输入' }, { id: 'input', kind: '验证' }]), /Duplicate node id/)
   assert.throws(() => validateRunGraph([{ id: 'input', kind: '输入' }], [{ from: 'input', to: 'missing' }]), /Unknown edge/)
   assert.throws(() => validateRunGraph([{ id: 'a', kind: '输入' }, { id: 'b', kind: '验证' }], [{ from: 'a', to: 'b' }, { from: 'b', to: 'a' }]), /contains a cycle/)
+})
+
+test('validation discovers commands created in the Worktree and keeps their approval run-scoped', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-worktree-validation-'))
+  const repository = join(root, 'fixture')
+  const state = join(root, 'state')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = state
+  try {
+    await createGitFixture(repository, 'worktree-validation')
+    const imported = await importProject(repository)
+    assert.equal(imported.environment.commands.test, undefined)
+    assert.equal(imported.environment.commands.build, undefined)
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    configureRunManagerForTests({ codexRunner: async input => {
+      await writeFile(join(input.cwd, 'package.json'), JSON.stringify({ name: 'generated', scripts: { test: 'node -e "process.exit(0)"' } }))
+      return 'Created a project with a test command.'
+    } })
+
+    const started = await startRun({
+      nodes: [
+        { id: 'implementation', kind: 'Agent', executorId: 'codex', outputType: 'code-change', prompt: 'Create the project.' },
+        { id: 'validation', kind: '验证', outputType: 'test-report' },
+      ],
+      edges: [{ from: 'implementation', to: 'validation' }],
+    })
+    let run = await waitForRun(started.id, value => value.status === 'awaiting_approval')
+    assert.equal(run.pendingCommandApproval?.command.command, 'npm install')
+    await approveRun(run.id)
+    run = await waitForRun(run.id, value => value.status === 'awaiting_approval' && value.pendingCommandApproval?.commandKey === 'test')
+    await approveRun(run.id)
+    run = await waitForRun(run.id, value => value.status === 'succeeded')
+    assert.equal(run.nodes.find(node => node.id === 'validation')?.state, 'success')
+    assert.equal((await loadProject())?.environment.commands.test, undefined)
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('run creates an isolated worktree, validates artifacts, retries a failed command, and recovers a lost attempt', async () => {
@@ -75,6 +115,10 @@ test('run creates an isolated worktree, validates artifacts, retries a failed co
     assert.equal(run.nodes.find(node => node.id === 'validation')?.attempts.length, 2)
     assert.ok(run.artifacts.every(artifact => artifact.schemaId && artifact.schemaVersion === 1 && artifact.validationErrors.length === 0))
     assert.ok(run.artifacts.some(artifact => artifact.type === 'git-diff'))
+    run = await requestDeliveryApproval(run.id) ?? run
+    assert.ok(run.deliveryApproval?.changedFiles.includes('implemented.txt'))
+    await approveRun(run.id)
+    assert.equal(await readFile(join(repository, 'implemented.txt'), 'utf8'), 'written in worktree')
 
     const manifestPath = join(state, 'runs', run.id, 'manifest.json')
     const interrupted = JSON.parse(await readFile(manifestPath, 'utf8')) as typeof run

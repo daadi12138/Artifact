@@ -79,7 +79,7 @@ export async function listRecentProjects(): Promise<RecentProject[]> {
 
 export async function importProject(inputPath: string): Promise<ProjectConfig> {
   const { repositoryPath, gitRoot } = await resolveGitProject(inputPath)
-  const environment = await detectEnvironment(gitRoot)
+  const environment = await detectProjectEnvironment(gitRoot)
   const now = new Date().toISOString()
   const existing = await loadProject()
   const commandAllowlist = existing?.gitRoot === gitRoot
@@ -223,7 +223,7 @@ export async function confirmProjectEnvironment(commands?: ProjectEnvironment['c
   return project
 }
 
-async function detectEnvironment(gitRoot: string): Promise<ProjectEnvironment> {
+export async function detectProjectEnvironment(gitRoot: string): Promise<ProjectEnvironment> {
   const detectedStack: ProjectEnvironment['detectedStack'] = [{ category: 'vcs', name: 'Git', evidence: ['.git'] }]
   const commands: ProjectEnvironment['commands'] = {}
   try {
@@ -235,7 +235,15 @@ async function detectEnvironment(gitRoot: string): Promise<ProjectEnvironment> {
     if (allDependencies.typescript) detectedStack.push({ category: 'language', name: 'TypeScript', version: allDependencies.typescript, evidence: ['package.json#devDependencies.typescript'] })
     const packageManager = packageJson.packageManager?.split('@')[0] ?? await detectPackageManager(gitRoot)
     const run = packageManager === 'yarn' ? 'yarn' : `${packageManager} run`
-    commands.install = { command: packageManager === 'npm' ? 'npm ci' : `${packageManager} install --frozen-lockfile`, cwd: '.', timeoutMs: 600_000 }
+    const hasLockfile = packageManager === 'npm'
+      ? await fileExists(join(gitRoot, 'package-lock.json'))
+      : packageManager === 'pnpm'
+        ? await fileExists(join(gitRoot, 'pnpm-lock.yaml'))
+        : await fileExists(join(gitRoot, 'yarn.lock'))
+    const installCommand = packageManager === 'npm'
+      ? hasLockfile ? 'npm ci' : 'npm install'
+      : hasLockfile ? `${packageManager} install --frozen-lockfile` : `${packageManager} install`
+    commands.install = { command: installCommand, cwd: '.', timeoutMs: 600_000 }
     for (const key of ['test', 'build', 'typecheck', 'lint'] as const) {
       if (packageJson.scripts?.[key]) commands[key] = { command: `${run} ${key}`, cwd: '.', timeoutMs: 600_000 }
     }
@@ -307,4 +315,8 @@ async function detectPackageManager(gitRoot: string): Promise<'npm' | 'pnpm' | '
     try { await stat(join(gitRoot, file)); return manager } catch { /* continue */ }
   }
   return 'npm'
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try { await stat(path); return true } catch { return false }
 }

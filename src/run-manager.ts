@@ -1,14 +1,14 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { appendFile, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { appendFile, cp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { schemaFor, validatePayload } from './artifact-schema'
-import { loadExecutorConfigs, refreshExecutorAuthentication, type ExecutorConfig } from './executor-config'
+import { resolveExecutorForRun, type ExecutorConfig } from './executor-config'
 import { notifyRunChanged } from './run-events'
-import { approveProjectCommand, isProjectCommandApproved, loadProject, type CommandSpec, type ProjectCommandKey, type ProjectConfig } from './project'
+import { approveProjectCommand, detectProjectEnvironment, isProjectCommandApproved, loadProject, type CommandSpec, type ProjectCommandKey, type ProjectConfig } from './project'
 
 export type RunNodeState = 'idle' | 'running' | 'paused' | 'success' | 'waiting' | 'failed' | 'cancelled' | 'skipped'
-export type RunStatus = 'preparing' | 'running' | 'paused' | 'awaiting_approval' | 'succeeded' | 'failed' | 'cancelled'
+export type RunStatus = 'preparing' | 'running' | 'paused' | 'awaiting_approval' | 'awaiting_delivery' | 'succeeded' | 'failed' | 'cancelled'
 export type RunInputAttachment = { id: string; name: string; mediaType: string; byteLength: number; dataUrl?: string; sourceUrl?: string }
 export type RunInput = { text: string; attachments: RunInputAttachment[]; submittedAt?: string }
 export type WorkflowRunReference = { workflowId: string; workflowName: string; revision: number; publishedAt: string }
@@ -20,7 +20,8 @@ export type RunNode = { id: string; kind: string; executorId?: string; prompt?: 
 export type RunEdge = { from: string; to: string }
 export type RunArtifact = { id: string; nodeId: string; attemptId?: string; type: string; version: number; schemaId: string; schemaVersion: number; status: 'valid' | 'awaiting_approval' | 'rejected' | 'invalid'; path: string; contentHash: string; inputArtifactIds: string[]; validationErrors: string[]; createdAt: string }
 export type PendingCommandApproval = { nodeId: string; commandKey: ProjectCommandKey; command: CommandSpec; requestedAt: string }
-export type RunSnapshot = { id: string; status: RunStatus; startedAt: string; endedAt?: string; project: ProjectConfig; workflow?: WorkflowRunReference; input: RunInput; baseGitRef?: string; branchName?: string; worktreePath?: string; pendingCommandApproval?: PendingCommandApproval; nodes: RunNode[]; edges: RunEdge[]; logs: string[]; events: RunEvent[]; artifacts: RunArtifact[] }
+export type DeliveryApproval = { requestedAt: string; changedFiles: string[]; worktreePath: string; projectPath: string }
+export type RunSnapshot = { id: string; status: RunStatus; startedAt: string; endedAt?: string; project: ProjectConfig; workflow?: WorkflowRunReference; input: RunInput; baseGitRef?: string; branchName?: string; worktreePath?: string; pendingCommandApproval?: PendingCommandApproval; deliveryApproval?: DeliveryApproval; autoRepairCount?: number; nodes: RunNode[]; edges: RunEdge[]; logs: string[]; events: RunEvent[]; artifacts: RunArtifact[] }
 export type StartRunInput = { nodes: Array<Omit<RunNode, 'state' | 'attempts' | 'steeringArtifactIds'>>; edges?: RunEdge[]; input?: RunInput; workflow?: WorkflowRunReference }
 type AgentActivity = { type: 'executor' | 'command' | 'activity'; message: string; details?: Record<string, string | number | boolean | null> }
 type AgentRunnerResult = { output: string; activities?: AgentActivity[] }
@@ -97,12 +98,26 @@ export async function listRuns(): Promise<RunSnapshot[]> {
 
 export async function approveRun(id: string): Promise<RunSnapshot | null> {
   const run = await getRun(id); if (!run) return null
+  if (run.deliveryApproval) {
+    await applyDelivery(run)
+    delete run.deliveryApproval
+    appendLog(run, `交付已批准 · 结果已应用到项目目录 ${run.project.repositoryPath}`)
+    await saveRun(run)
+    return run
+  }
   const approval = run.nodes.find(node => node.state === 'waiting'); if (!approval || run.status !== 'awaiting_approval') return run
   if (run.pendingCommandApproval) {
     const pending = run.pendingCommandApproval
     if (approval.id !== pending.nodeId) throw new Error('The waiting node does not match the requested command approval')
-    const project = await approveProjectCommand(pending.commandKey, pending.command)
-    run.project = structuredClone(project)
+    const project = await loadProject()
+    const projectCommand = project?.environment.commands[pending.commandKey]
+    if (project && projectCommand && sameCommand(projectCommand, pending.command)) {
+      run.project = structuredClone(await approveProjectCommand(pending.commandKey, pending.command))
+    } else {
+      // Commands detected only after an Agent creates a project belong to this
+      // run's Worktree. Approval must not add them to the original project.
+      run.project.environment.commandAllowlist[pending.commandKey] = { ...pending.command, approvedAt: new Date().toISOString() }
+    }
     approval.state = 'idle'
     delete run.pendingCommandApproval
     run.status = 'running'
@@ -115,8 +130,27 @@ export async function approveRun(id: string): Promise<RunSnapshot | null> {
   await saveRun(run); void processRun(id); return run
 }
 
+export async function requestDeliveryApproval(id: string): Promise<RunSnapshot | null> {
+  const run = await getRun(id); if (!run) return null
+  if (run.status !== 'succeeded') throw new Error('Only a completed run can be delivered')
+  if (!run.worktreePath) throw new Error('Worktree is not prepared')
+  const changedFiles = await worktreeChangedFiles(run.worktreePath)
+  if (!changedFiles.length) throw new Error('No Worktree changes are available for delivery')
+  run.deliveryApproval = { requestedAt: new Date().toISOString(), changedFiles, worktreePath: run.worktreePath, projectPath: run.project.repositoryPath }
+  appendLog(run, `已准备交付审批 · ${changedFiles.length} 项变更等待确认`)
+  await saveRun(run)
+  return run
+}
+
 export async function rejectRun(id: string): Promise<RunSnapshot | null> {
   const run = await getRun(id); if (!run) return null
+  if (run.deliveryApproval) {
+    delete run.deliveryApproval
+    run.status = 'failed'; run.endedAt = new Date().toISOString()
+    appendLog(run, '交付已拒绝 · Worktree 中的变更未应用到项目目录')
+    await saveRun(run)
+    return run
+  }
   const approval = run.nodes.find(node => node.state === 'waiting'); if (!approval || run.status !== 'awaiting_approval') return run
   if (run.pendingCommandApproval) {
     const pending = run.pendingCommandApproval
@@ -248,11 +282,22 @@ async function processRun(id: string): Promise<void> {
       run = await getRun(id); if (!run || run.status !== 'running') return
       const ready = run.nodes.find(node => node.state === 'idle' && parentsSucceeded(run!, node.id))
       if (!ready) {
-        if (run.nodes.every(node => node.state === 'success' || node.state === 'skipped')) { run.status = 'succeeded'; run.endedAt = new Date().toISOString(); appendLog(run, '工作流已成功完成'); await saveRun(run) }
+        if (run.nodes.every(node => node.state === 'success' || node.state === 'skipped')) {
+          run.status = 'succeeded'; run.endedAt = new Date().toISOString()
+          if (run.worktreePath) {
+            const changedFiles = await worktreeChangedFiles(run.worktreePath)
+            if (changedFiles.length) {
+              run.deliveryApproval = { requestedAt: new Date().toISOString(), changedFiles, worktreePath: run.worktreePath, projectPath: run.project.repositoryPath }
+              appendLog(run, `工作流已完成 · ${changedFiles.length} 项变更等待交付审批`)
+            } else appendLog(run, '工作流已成功完成 · 未检测到文件变更')
+          } else appendLog(run, '工作流已成功完成')
+          await saveRun(run)
+        }
         else if (!run.nodes.some(node => node.state === 'waiting' || node.state === 'running')) { run.status = 'failed'; run.endedAt = new Date().toISOString(); appendLog(run, '工作流无法继续：前置节点未成功'); await saveRun(run) }
         return
       }
       if (ready.kind === '验证') {
+        await discoverWorktreeValidationCommands(run)
         const pendingCommand = firstUnapprovedValidationCommand(run)
         if (pendingCommand) {
           ready.state = 'waiting'
@@ -288,6 +333,21 @@ async function processRun(id: string): Promise<void> {
         const failure = normalizePublicText(errorMessage(error), publicTraceContentLimit).value ?? 'Executor failed.'
         node.state = 'failed'; latestAttempt.status = 'failed'; latestAttempt.endedAt = new Date().toISOString(); latestAttempt.exitReason = failure
         if (node.kind === 'Agent') await appendAgentTrace(latest, node, latestAttempt, { kind: 'error', content: failure })
+        const repairableValidationFailure = /TS\d{4}|cannot find module|module or type declarations|tsc\s+-b|vite\s+build|syntaxerror/i.test(failure)
+        if (node.kind === '验证' && repairableValidationFailure && (latest.autoRepairCount ?? 0) < 2) {
+          const repairAgent = [...latest.nodes].reverse().find(candidate => candidate.kind === 'Agent' && latest.edges.some(edge => edge.from === candidate.id && edge.to === node.id))
+          if (repairAgent) {
+            latest.autoRepairCount = (latest.autoRepairCount ?? 0) + 1
+            const repair = await writeArtifact(latest, { id: `auto-repair-${node.id}`, kind: '操作说明', outputType: 'operator-note', state: 'success', attempts: [] }, reportPayload('验证失败，自动修复上下文', `验证节点 ${node.id} 失败：\n${failure}\n\n请修复后重新运行验证。`))
+            repairAgent.steeringArtifactIds = [...(repairAgent.steeringArtifactIds ?? []), repair.id]
+            node.state = 'idle'; repairAgent.state = 'idle'
+            for (const downstream of collectDownstream(latest, node.id)) latest.nodes.find(item => item.id === downstream)!.state = 'idle'
+            latest.status = 'running'; delete latest.endedAt
+            appendLog(latest, `${node.id} · 验证失败，已请求 Agent 自动修复（第 ${latest.autoRepairCount}/2 轮）`)
+            await saveRun(latest)
+            continue
+          }
+        }
         markDownstream(latest, node.id, 'skipped'); latest.status = 'failed'; latest.endedAt = new Date().toISOString(); appendLog(latest, `${node.id} · Attempt ${latestAttempt.attempt} 失败：${failure}`); await saveRun(latest); return
       }
     }
@@ -315,7 +375,7 @@ async function executeNode(run: RunSnapshot, node: RunNode, attempt: StepAttempt
   if (!run.worktreePath) throw new Error('Worktree is not prepared')
   if (node.kind === '输入') return reportPayload('需求已冻结', runInputContent(run.input, node.prompt))
   if (node.kind === 'Agent') {
-    const executors = await loadExecutorConfigs(); const executor = executors.find(item => item.id === (node.executorId ?? 'codex'))
+    const executor = await resolveExecutorForRun(node.executorId ?? 'codex')
     assertExecutorReady(executor, node.executorId ?? 'codex')
     const adapter = agentAdapters.get(executor.id)
     if (!adapter) throw new Error(`Executor adapter not implemented: ${executor.id}`)
@@ -366,10 +426,8 @@ async function executeNode(run: RunSnapshot, node: RunNode, attempt: StepAttempt
 async function validateAgentExecutors(nodes: Array<Omit<RunNode, 'state' | 'attempts'>>): Promise<void> {
   const requestedIds = [...new Set(nodes.filter(node => node.kind === 'Agent').map(node => node.executorId ?? 'codex'))]
   if (!requestedIds.length) return
-  const executors = await loadExecutorConfigs()
   for (const id of requestedIds) {
-    let executor = executors.find(item => item.id === id)
-    if (executor?.status === 'available' && executor.authentication === 'unknown') executor = await refreshExecutorAuthentication(id)
+    const executor = await resolveExecutorForRun(id)
     assertExecutorReady(executor, id)
     if (!agentAdapters.has(executor.id)) throw new Error(`Executor adapter not implemented: ${executor.id}`)
   }
@@ -441,6 +499,7 @@ async function writeArtifact(run: RunSnapshot, node: RunNode, payload: Record<st
 async function saveArtifactManifest(run: RunSnapshot, artifact: RunArtifact): Promise<void> { await atomicWrite(join(dirname(join(runDirectory(run.id), artifact.path)), 'manifest.json'), JSON.stringify(artifact, null, 2)) }
 function normalizeRun(run: RunSnapshot): RunSnapshot {
   run.project.environment.commandAllowlist ??= {}
+  run.autoRepairCount ??= 0
   run.input = normalizeRunInput(run.input)
   run.events ??= []
   run.nodes = (run.nodes ?? []).map(node => ({
@@ -473,6 +532,49 @@ function validationCommands(run: RunSnapshot): Array<{ key: ProjectCommandKey; c
   if (!checks.length) return []
   const keys: ProjectCommandKey[] = commands.install ? ['install', ...checks] : checks
   return keys.flatMap(key => commands[key] ? [{ key, command: commands[key]! }] : [])
+}
+
+async function discoverWorktreeValidationCommands(run: RunSnapshot): Promise<void> {
+  if (!run.worktreePath || validationCommands(run).length) return
+  const environment = await detectProjectEnvironment(run.worktreePath)
+  const discovered = environment.commands
+  if (!(['typecheck', 'test', 'build', 'lint'] as const).some(key => discovered[key])) return
+  run.project.environment = {
+    ...run.project.environment,
+    detectedStack: environment.detectedStack,
+    commands: discovered,
+  }
+  appendEvent(run, 'command', '已从 Worktree 识别验证命令，等待本次运行确认', undefined, undefined, { commandCount: validationCommands(run).length })
+  await saveRun(run)
+}
+
+async function worktreeChangedFiles(worktreePath: string): Promise<string[]> {
+  const [tracked, untracked] = await Promise.all([
+    runProcess('git', ['diff', '--name-only', 'HEAD'], worktreePath, 15_000),
+    runProcess('git', ['ls-files', '--others', '--exclude-standard'], worktreePath, 15_000),
+  ])
+  return [...new Set([...tracked.split(/\r?\n/), ...untracked.split(/\r?\n/)].map(file => file.trim()).filter(Boolean))]
+}
+
+async function applyDelivery(run: RunSnapshot): Promise<void> {
+  const delivery = run.deliveryApproval
+  if (!delivery) return
+  const sourceRoot = resolve(delivery.worktreePath)
+  const targetRoot = resolve(delivery.projectPath)
+  for (const file of delivery.changedFiles) {
+    const source = resolve(sourceRoot, file)
+    const target = resolve(targetRoot, file)
+    const sourceRelative = relative(sourceRoot, source)
+    const targetRelative = relative(targetRoot, target)
+    if (sourceRelative.startsWith('..') || isAbsolute(sourceRelative) || targetRelative.startsWith('..') || isAbsolute(targetRelative)) throw new Error(`Invalid delivery path: ${file}`)
+    const status = (await runProcess('git', ['status', '--porcelain', '--', file], delivery.worktreePath, 15_000)).slice(0, 2)
+    if (status.includes('D')) await rm(target, { recursive: true, force: true })
+    else { await mkdir(dirname(target), { recursive: true }); await cp(source, target, { recursive: true, force: true }) }
+  }
+}
+
+function sameCommand(left: CommandSpec, right: CommandSpec): boolean {
+  return left.command === right.command && left.cwd === right.cwd && left.timeoutMs === right.timeoutMs
 }
 function firstUnapprovedValidationCommand(run: RunSnapshot): { key: ProjectCommandKey; command: CommandSpec } | null {
   return validationCommands(run).find(({ key, command }) => !isProjectCommandApproved(run.project, key, command)) ?? null

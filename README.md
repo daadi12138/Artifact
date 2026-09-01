@@ -37,8 +37,8 @@ npm run cli:build
 
 - Git project import with detected Node.js commands and approval before an unreviewed validation command runs.
 - A dedicated Git Worktree and temporary branch for every Run; the imported working directory is never used for Agent writes.
-- Drag-and-drop workflow canvas with persisted prompts, node library, and configurable executors.
-- Codex and Claude Code runtime configuration persisted in the Artifact state directory, including live CLI probes, authorization state, and reviewed model selection.
+- Drag-and-drop workflow canvas with persisted prompts, node library, and runtime selection per Agent node.
+- Read-only Codex and Claude Code runtime discovery for current CLI status, authorization state, connectivity, and available models.
 - DAG validation for duplicate nodes, invalid edges, self edges, and cycles.
 - Durable, atomic Run manifests with frozen project/environment snapshots and per-step Attempt history.
 - Approval, rejection, cancellation, failed-step retry, and automatic `process_lost` recovery after a service restart.
@@ -56,7 +56,7 @@ This is a single-user, local-first release bound to `127.0.0.1`. Agent changes a
 
 Artifact never stores an API key. Install and sign in to Codex once with `codex login`; Codex keeps its own login state and Artifact only checks whether that state is available. Claude Code can be signed in from its interactive CLI with `/login`. For API-key use, set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in the environment that starts Artifact. In development this can be `OPENAI_API_KEY=... npm run electron:dev`; for the packaged app, CLI login is the reliable option because Finder-launched apps do not inherit shell environment variables.
 
-The Executor settings page lets the user select a reviewed model for either runtime or defer to that CLI's default model. Artifact passes the selection with the CLI's `--model` option and never edits either CLI's own configuration files.
+The runtime page is read-only: it shows the local CLI state, connectivity, and models reported by each CLI. Artifact does not install, update, connect, sign in to, or configure an Agent runtime. Runs defer model selection to the CLI's current default.
 
 ## Quality checks
 

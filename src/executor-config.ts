@@ -52,7 +52,7 @@ export type ExecutorDefinition = Pick<ExecutorConfig, 'id' | 'name' | 'type' | '
   installPlan?: ExecutorInstallPlan
 }
 
-export type ExecutorEnvironmentState = 'ready' | 'discovered' | 'update_available' | 'not_installed' | 'error'
+export type ExecutorEnvironmentState = 'ready' | 'not_installed' | 'error'
 
 export type ExecutorEnvironment = Pick<ExecutorDefinition, 'id' | 'name' | 'type' | 'icon' | 'tone' | 'capabilities' | 'modelOptions'> & {
   command: string
@@ -106,7 +106,7 @@ export const executorDefinitions: ExecutorDefinition[] = [
     tone: 'orange',
     command: 'claude',
     versionArgs: ['--version'],
-    model: 'sonnet',
+    model: '',
     modelOptions: [
       { value: 'sonnet', label: 'Sonnet' },
       { value: 'opus', label: 'Opus' },
@@ -125,7 +125,7 @@ export const executorDefinitions: ExecutorDefinition[] = [
     tone: 'blue',
     command: 'codex',
     versionArgs: ['--version'],
-    model: 'gpt-5-codex',
+    model: '',
     modelOptions: [
       { value: 'gpt-5-codex', label: 'gpt-5-codex' },
       { value: '', label: '使用 Codex CLI 默认模型' },
@@ -226,10 +226,8 @@ export async function resolveExecutable(command: string): Promise<string | undef
 }
 
 export async function scanLocalExecutors(options: { includeLatest?: boolean } = {}): Promise<ExecutorEnvironmentReport> {
-  const configs = await loadExecutorConfigs()
   const executors = await Promise.all(executorDefinitions.map(async definition => {
-    const config = configs.find(item => item.id === definition.id)
-    const executablePath = await resolveExecutable(config?.path || definition.command) ?? await resolveExecutable(definition.command)
+    const executablePath = await resolveExecutable(definition.command)
     const base = {
       id: definition.id,
       name: definition.name,
@@ -238,33 +236,53 @@ export async function scanLocalExecutors(options: { includeLatest?: boolean } = 
       tone: definition.tone,
       command: definition.command,
       platform: platformName(),
-      connected: Boolean(config?.status === 'available' && executablePath),
+      connected: Boolean(executablePath),
       capabilities: definition.capabilities,
-      model: modelIsAllowed(definition.id, config?.model, config?.modelCatalog) ? config!.model : definition.model,
-      modelOptions: modelOptionsFor(definition, config?.modelCatalog),
-      modelCatalog: normalizeModelCatalog(config?.modelCatalog),
-      installPlan: definition.installPlan ? { display: definition.installPlan.display } : undefined,
-      authentication: normalizeAuthentication(config?.authentication),
+      model: '',
+      modelOptions: definition.modelOptions,
+      authentication: 'unknown' as ExecutorAuthenticationState,
     }
     if (!executablePath) return { ...base, state: 'not_installed' as const }
     try {
       const currentVersion = await readVersion(executablePath, definition.versionArgs)
-      const latestVersion = options.includeLatest && definition.installPlan?.packageName ? await readLatestNpmVersion(definition.installPlan.packageName) : undefined
-      const updateAvailable = Boolean(latestVersion && isOlderVersion(currentVersion, latestVersion))
       const authentication = await readAuthentication(definition, executablePath)
       return {
         ...base,
         authentication,
         executablePath,
         currentVersion,
-        latestVersion,
-        state: updateAvailable ? 'update_available' as const : config?.status === 'available' ? 'ready' as const : 'discovered' as const,
+        state: 'ready' as const,
       }
     } catch (error) {
       return { ...base, executablePath, state: 'error' as const, error: compactError(error) }
     }
   }))
-  return { scannedAt: new Date().toISOString(), executors, updateCount: executors.filter(item => item.state === 'update_available').length }
+  return { scannedAt: new Date().toISOString(), executors, updateCount: 0 }
+}
+
+// Resolve immediately before a Run. This is intentionally not persisted: the
+// CLI installation, login state, and selected default model remain CLI-owned.
+export async function resolveExecutorForRun(id: string): Promise<ExecutorConfig> {
+  const definition = executorDefinition(id)
+  if (!definition) throw new Error(`Unsupported executor: ${id}`)
+  const saved = (await loadExecutorConfigs()).find(config => config.id === id)
+  // Test fixtures may point at a temporary executable. Production uses the
+  // runtime's standard command and never accepts a path from the UI.
+  if (saved?.type === 'test') return saved
+  const executablePath = await resolveExecutable(definition.command)
+  if (!executablePath) throw new Error(`${definition.name} is not installed or is not on PATH`)
+  const [version, authentication] = await Promise.all([
+    readVersion(executablePath, definition.versionArgs),
+    readAuthentication(definition, executablePath),
+  ])
+  return {
+    ...defaultExecutorConfigs.find(config => config.id === id)!,
+    path: executablePath,
+    version,
+    status: 'available',
+    authentication,
+    authenticationCheckedAt: new Date().toISOString(),
+  }
 }
 
 export async function connectExecutor(id: string): Promise<ExecutorConfig> {
@@ -318,16 +336,12 @@ export async function refreshExecutorAuthentication(id: string): Promise<Executo
 export async function discoverExecutorModels(id: string): Promise<ExecutorModelCatalog> {
   const definition = executorDefinition(id)
   if (!definition) throw new Error('Unsupported executor')
-  const configs = await loadExecutorConfigs()
-  const existing = configs.find(config => config.id === id)
-  const path = await resolveExecutable(existing?.path || definition.command) ?? await resolveExecutable(definition.command)
+  const path = await resolveExecutable(definition.command)
   if (!path) throw new Error(`${definition.name} is not installed or is not on PATH`)
   const cliVersion = await readVersion(path, definition.versionArgs)
   const catalog = definition.id === 'codex'
     ? await readCodexModelCatalog(path, cliVersion)
     : await readClaudeModelCatalog(path, cliVersion)
-  const updated = configs.map(config => config.id === id ? { ...config, path, version: cliVersion, modelCatalog: catalog } : config)
-  await saveExecutorConfigs(updated)
   return catalog
 }
 

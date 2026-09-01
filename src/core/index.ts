@@ -20,32 +20,12 @@ export {
 } from '../project'
 
 export {
-  defaultExecutorConfigs,
-  executorDefinitions,
-  executorDefinition,
-  connectExecutor,
-  configureExecutor,
   discoverExecutorModels,
-  diagnoseExecutorInstallations,
-  executableExists,
-  isOlderVersion,
-  loadExecutorConfigs,
-  maintainExecutors,
-  manualInstallCommands,
-  mergeExecutorConfigs,
-  modelIsAllowed,
-  refreshExecutorAuthentication,
-  resolveExecutable,
-  saveExecutorConfigs,
+  resolveExecutorForRun,
   scanLocalExecutors,
-  type ExecutorConfig,
-  type ExecutorAuthenticationState,
   type ExecutorEnvironment,
   type ExecutorEnvironmentReport,
-  type ExecutorInstallationDiagnostic,
-  type ExecutorMaintenanceResult,
   type ExecutorModelCatalog,
-  type ExecutorModelOption,
 } from '../executor-config'
 
 export {
@@ -84,6 +64,7 @@ export {
   pauseRun,
   readArtifactPayload,
   rejectRun,
+  requestDeliveryApproval,
   resumeRun,
   resumeInterruptedRuns,
   retryRun,

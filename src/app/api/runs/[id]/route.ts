@@ -1,4 +1,4 @@
-import { approveRun, cancelRun, getRun, pauseRun, rejectRun, resumeRun, retryRun, steerRun } from '@artifact/core'
+import { approveRun, cancelRun, getRun, pauseRun, rejectRun, requestDeliveryApproval, resumeRun, retryRun, steerRun } from '@artifact/core'
 
 export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) { const { id } = await context.params; const run = await getRun(id); return run ? Response.json(run) : Response.json({ error: 'Run not found' }, { status: 404 }) }
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
@@ -24,6 +24,10 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   if (body.action === 'steer') {
     if (!body.nodeId || !body.note) return Response.json({ error: 'nodeId and note are required' }, { status: 400 })
     try { const run = await steerRun(id, body.nodeId, body.note); return run ? Response.json(run) : Response.json({ error: 'Run not found' }, { status: 404 }) }
+    catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 }) }
+  }
+  if (body.action === 'request_delivery') {
+    try { const run = await requestDeliveryApproval(id); return run ? Response.json(run) : Response.json({ error: 'Run not found' }, { status: 404 }) }
     catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 }) }
   }
   const actions = { approve: approveRun, reject: rejectRun, cancel: cancelRun } as const
