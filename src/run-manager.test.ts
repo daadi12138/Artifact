@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { importProject, loadProject } from './project'
 import { saveExecutorConfigs } from './executor-config'
-import { approveRun, configureRunManagerForTests, getRun, pauseRun, requestDeliveryApproval, resumeInterruptedRuns, resumeRun, retryRun, startRun, steerRun, validateRunGraph } from './run-manager'
+import { answerRunInteraction, approveRun, configureRunManagerForTests, getRun, pauseRun, requestDeliveryApproval, requestRunInteraction, resumeInterruptedRuns, resumeRun, retryRun, startRun, steerRun, validateRunGraph } from './run-manager'
 
 const execFileAsync = promisify(execFile)
 
@@ -23,6 +23,36 @@ test('run graph rejects invalid dependencies before execution', () => {
   assert.throws(() => validateRunGraph([{ id: 'input', kind: '输入' }, { id: 'input', kind: '验证' }]), /Duplicate node id/)
   assert.throws(() => validateRunGraph([{ id: 'input', kind: '输入' }], [{ from: 'input', to: 'missing' }]), /Unknown edge/)
   assert.throws(() => validateRunGraph([{ id: 'a', kind: '输入' }, { id: 'b', kind: '验证' }], [{ from: 'a', to: 'b' }, { from: 'b', to: 'a' }]), /contains a cycle/)
+})
+
+test('validation records missing commands without failing a completed workflow', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-validation-uncovered-'))
+  const repository = join(root, 'fixture')
+  const state = join(root, 'state')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = state
+  try {
+    await createGitFixture(repository, 'validation-uncovered')
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    configureRunManagerForTests({ codexRunner: async () => 'Reviewed the project without changing files.' })
+
+    const started = await startRun({
+      nodes: [
+        { id: 'analysis', kind: 'Agent', executorId: 'codex', outputType: 'agent-report', executionMode: 'read_only', prompt: 'Review the project.' },
+        { id: 'validation', kind: '验证', outputType: 'test-report' },
+      ],
+      edges: [{ from: 'analysis', to: 'validation' }],
+    })
+    const run = await waitForRun(started.id, value => value.status === 'succeeded')
+    assert.equal(run.nodes.find(node => node.id === 'validation')?.state, 'success')
+    assert.equal(run.lastFailure, undefined)
+    assert.ok(run.artifacts.some(artifact => artifact.nodeId === 'validation' && artifact.type === 'test-report' && artifact.status === 'valid'))
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('validation discovers commands created in the Worktree and keeps their approval run-scoped', async () => {
@@ -54,8 +84,10 @@ test('validation discovers commands created in the Worktree and keeps their appr
     await approveRun(run.id)
     run = await waitForRun(run.id, value => value.status === 'awaiting_approval' && value.pendingCommandApproval?.commandKey === 'test')
     await approveRun(run.id)
-    run = await waitForRun(run.id, value => value.status === 'succeeded')
+    run = await waitForRun(run.id, value => value.status === 'awaiting_delivery')
     assert.equal(run.nodes.find(node => node.id === 'validation')?.state, 'success')
+    await approveRun(run.id)
+    run = await waitForRun(run.id, value => value.status === 'succeeded')
     assert.equal((await loadProject())?.environment.commands.test, undefined)
   } finally {
     configureRunManagerForTests()
@@ -111,13 +143,14 @@ test('run creates an isolated worktree, validates artifacts, retries a failed co
 
     await writeFile(join(run.worktreePath!, 'pass.flag'), 'ready')
     await retryRun(run.id, 'validation')
-    run = await waitForRun(run.id, value => value.status === 'succeeded')
+    run = await waitForRun(run.id, value => value.status === 'awaiting_delivery')
     assert.equal(run.nodes.find(node => node.id === 'validation')?.attempts.length, 2)
     assert.ok(run.artifacts.every(artifact => artifact.schemaId && artifact.schemaVersion === 1 && artifact.validationErrors.length === 0))
     assert.ok(run.artifacts.some(artifact => artifact.type === 'git-diff'))
     run = await requestDeliveryApproval(run.id) ?? run
     assert.ok(run.deliveryApproval?.changedFiles.includes('implemented.txt'))
     await approveRun(run.id)
+    run = await waitForRun(run.id, value => value.status === 'succeeded')
     assert.equal(await readFile(join(repository, 'implemented.txt'), 'utf8'), 'written in worktree')
 
     const manifestPath = join(state, 'runs', run.id, 'manifest.json')
@@ -129,8 +162,161 @@ test('run creates an isolated worktree, validates artifacts, retries a failed co
     delivery.attempts.push({ id: 'attempt-interrupted', attempt: delivery.attempts.length + 1, executorId: 'local', status: 'running', startedAt: new Date().toISOString() })
     await writeFile(manifestPath, JSON.stringify(interrupted, null, 2))
     await resumeInterruptedRuns()
-    run = await waitForRun(run.id, value => value.status === 'succeeded' && value.nodes.find(node => node.id === 'delivery')!.attempts.length >= 3)
+    run = await waitForRun(run.id, value => value.status === 'awaiting_delivery' && value.nodes.find(node => node.id === 'delivery')!.attempts.length >= 3)
     assert.equal(run.nodes.find(node => node.id === 'delivery')?.attempts.find(attempt => attempt.id === 'attempt-interrupted')?.exitReason, 'process_lost')
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('recovery pauses a run when its recorded process is still alive', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-live-process-'))
+  const state = join(root, 'state')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = state
+  try {
+    const now = new Date().toISOString()
+    const runId = `run-live-${Date.now()}`
+    const manifest = {
+      id: runId,
+      status: 'running',
+      startedAt: now,
+      project: {
+        id: 'project-live-process', name: 'fixture', repositoryPath: root, gitRoot: root, status: 'ready', createdAt: now, updatedAt: now,
+        environment: { version: 1, detectedStack: [], commands: {}, commandAllowlist: {}, confirmedByUser: true },
+      },
+      input: { text: '', attachments: [], submittedAt: now },
+      nodes: [{
+        id: 'agent', kind: 'Agent', executorId: 'codex', outputType: 'agent-report', state: 'running', steeringArtifactIds: [],
+        attempts: [{ id: 'attempt-live', attempt: 1, executorId: 'codex', status: 'running', startedAt: now, process: { pid: process.pid, commandHash: 'a'.repeat(64), startedAt: now } }],
+      }],
+      edges: [], logs: [], events: [], artifacts: [],
+    }
+    await mkdir(join(state, 'runs', runId), { recursive: true })
+    await writeFile(join(state, 'runs', runId, 'manifest.json'), JSON.stringify(manifest, null, 2))
+
+    await resumeInterruptedRuns()
+    const paused = await getRun(runId)
+    assert.equal(paused?.status, 'paused')
+    assert.equal(paused?.nodes[0]?.state, 'paused')
+    assert.equal(paused?.nodes[0]?.attempts[0]?.exitReason, 'process_still_running')
+    await assert.rejects(() => resumeRun(runId), /may still be running outside Artifact/)
+  } finally {
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('delivery applies added, deleted, and renamed files while excluding generated output', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-delivery-'))
+  const repository = join(root, 'fixture')
+  const state = join(root, 'state')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = state
+  try {
+    await createGitFixture(repository, 'delivery-fixture')
+    await writeFile(join(repository, 'remove-me.ts'), 'export const obsolete = true\n')
+    await writeFile(join(repository, 'rename-me.ts'), 'export const retained = true\n')
+    await execFileAsync('git', ['add', 'remove-me.ts', 'rename-me.ts'], { cwd: repository })
+    await execFileAsync('git', ['-c', 'user.name=Artifact Test', '-c', 'user.email=artifact@example.test', 'commit', '-m', 'delivery files'], { cwd: repository })
+    await importProject(repository)
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    configureRunManagerForTests({ codexRunner: async input => {
+      await writeFile(join(input.cwd, 'added.ts'), 'export const added = true\n')
+      await writeFile(join(input.cwd, 'renamed.ts'), await readFile(join(input.cwd, 'rename-me.ts'), 'utf8'))
+      await rm(join(input.cwd, 'rename-me.ts'))
+      await rm(join(input.cwd, 'remove-me.ts'))
+      await mkdir(join(input.cwd, 'build'), { recursive: true })
+      await writeFile(join(input.cwd, 'build', 'ignored.js'), 'generated output\n')
+      return 'Prepared the delivery changes.'
+    } })
+
+    const started = await startRun({ nodes: [{ id: 'implementation', kind: 'Agent', executorId: 'codex', outputType: 'code-change', executionMode: 'workspace_write', prompt: 'Prepare source files.' }] })
+    let run = await waitForRun(started.id, value => value.status === 'awaiting_delivery')
+    const changes = run.deliveryApproval?.changes ?? []
+    assert.ok(changes.some(change => change.operation === 'add' && change.path === 'added.ts'))
+    assert.ok(changes.some(change => change.operation === 'delete' && change.path === 'remove-me.ts'))
+    assert.ok(changes.some(change => change.operation === 'rename' && change.previousPath === 'rename-me.ts' && change.path === 'renamed.ts'))
+    assert.equal(changes.some(change => change.path === 'build/ignored.js'), false)
+
+    await approveRun(run.id)
+    run = await waitForRun(run.id, value => value.status === 'succeeded')
+    assert.equal(await readFile(join(repository, 'added.ts'), 'utf8'), 'export const added = true\n')
+    assert.equal(await readFile(join(repository, 'renamed.ts'), 'utf8'), 'export const retained = true\n')
+    await assert.rejects(readFile(join(repository, 'remove-me.ts'), 'utf8'))
+    await assert.rejects(readFile(join(repository, 'rename-me.ts'), 'utf8'))
+    await assert.rejects(readFile(join(repository, 'build', 'ignored.js'), 'utf8'))
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('delivery blocks a project file changed after the run began', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-delivery-conflict-'))
+  const repository = join(root, 'fixture')
+  const state = join(root, 'state')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = state
+  try {
+    await createGitFixture(repository, 'delivery-conflict')
+    await writeFile(join(repository, 'shared.ts'), 'export const version = "base"\n')
+    await execFileAsync('git', ['add', 'shared.ts'], { cwd: repository })
+    await execFileAsync('git', ['-c', 'user.name=Artifact Test', '-c', 'user.email=artifact@example.test', 'commit', '-m', 'shared file'], { cwd: repository })
+    await importProject(repository)
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    configureRunManagerForTests({ codexRunner: async input => {
+      await writeFile(join(input.cwd, 'shared.ts'), 'export const version = "worktree"\n')
+      return 'Changed the shared file.'
+    } })
+
+    const started = await startRun({ nodes: [{ id: 'implementation', kind: 'Agent', executorId: 'codex', outputType: 'code-change', executionMode: 'workspace_write', prompt: 'Change the shared file.' }] })
+    const waiting = await waitForRun(started.id, value => value.status === 'awaiting_delivery')
+    await writeFile(join(repository, 'shared.ts'), 'export const version = "project"\n')
+    const run = await approveRun(waiting.id)
+    assert.equal(run?.status, 'awaiting_delivery')
+    assert.ok(run?.deliveryApproval?.changes.some(change => change.path === 'shared.ts' && change.conflicts.length > 0))
+    assert.equal(await readFile(join(repository, 'shared.ts'), 'utf8'), 'export const version = "project"\n')
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Agent execution mode controls Worktree write permission without changing executor configuration', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-execution-mode-'))
+  const repository = join(root, 'fixture')
+  const state = join(root, 'state')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = state
+  try {
+    await createGitFixture(repository, 'execution-mode')
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    const permissions = new Map<string, boolean>()
+    configureRunManagerForTests({ codexRunner: async input => {
+      permissions.set(input.prompt.includes('Read-only instruction.') ? 'read-only' : 'write', input.writable)
+      return 'Completed the requested analysis.'
+    } })
+
+    const started = await startRun({
+      nodes: [
+        { id: 'implementation', kind: 'Agent', executorId: 'codex', outputType: 'code-change', executionMode: 'read_only', prompt: 'Read-only instruction.' },
+        { id: 'review', kind: 'Agent', executorId: 'codex', outputType: 'agent-report', executionMode: 'workspace_write', prompt: 'Write-capable instruction.' },
+      ],
+      edges: [{ from: 'implementation', to: 'review' }],
+    })
+    const run = await waitForRun(started.id, value => value.status === 'succeeded')
+    assert.equal(permissions.get('read-only'), false)
+    assert.equal(permissions.get('write'), true)
+    assert.equal(run.nodes.every(node => node.state === 'success'), true)
   } finally {
     configureRunManagerForTests()
     if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
@@ -200,7 +386,7 @@ console.log(JSON.stringify({ type: 'item.completed', item: { id: 'message-1', ty
       edges: [{ from: 'requirement', to: 'analysis' }],
       input: { text: 'Trace this request with API_KEY=super-secret-value.', attachments: [] },
     })
-    const run = await waitForRun(started.id, value => value.status === 'succeeded')
+    const run = await waitForRun(started.id, value => value.status === 'awaiting_delivery')
     const attempt = run.nodes.find(node => node.id === 'analysis')?.attempts[0]
     assert.ok(attempt?.promptSnapshot)
     assert.equal(attempt.promptSnapshot.nodeInstruction, 'Inspect the frozen requirement.')
@@ -212,6 +398,9 @@ console.log(JSON.stringify({ type: 'item.completed', item: { id: 'message-1', ty
     const receivedPrompt = await readFile(join(run.worktreePath!, 'received-prompt.txt'), 'utf8')
     assert.match(receivedPrompt, /super-secret-value/)
     assert.equal(attempt.promptSnapshot.contentHash, createHash('sha256').update(receivedPrompt).digest('hex'))
+    assert.ok(Number.isSafeInteger(attempt.process?.pid))
+    assert.match(attempt.process?.commandHash ?? '', /^[0-9a-f]{64}$/)
+    assert.ok(attempt.process?.startedAt)
     const argv = JSON.parse(await readFile(join(run.worktreePath!, 'received-argv.json'), 'utf8')) as string[]
     assert.equal(argv.includes(receivedPrompt), false)
     assert.equal(attempt.finalResponse, 'Final public answer. auth_token=[REDACTED]')
@@ -329,6 +518,69 @@ test('a paused agent run freezes an operator note and resumes in a new attempt',
   }
 })
 
+test('an Agent can request structured user input and resume with the response artifact', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-run-interaction-'))
+  const repository = join(root, 'fixture')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = join(root, 'state')
+  try {
+    await createGitFixture(repository, 'interaction-fixture')
+    await importProject(repository)
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    let calls = 0
+    configureRunManagerForTests({ codexRunner: async input => {
+      calls += 1
+      if (calls === 1) await input.onInteraction?.({ kind: 'choice', title: '选择发布环境', question: '应该部署到哪个环境？', options: [{ id: 'staging', label: '测试环境' }, { id: 'production', label: '生产环境' }], required: true })
+      return calls === 1 ? '等待用户选择。' : '已按用户选择完成部署准备。'
+    } })
+    const started = await startRun({ nodes: [{ id: 'agent', kind: 'Agent', executorId: 'codex', outputType: 'agent-report', prompt: '准备发布。' }] })
+    let run = await waitForRun(started.id, value => value.status === 'awaiting_input')
+    const interaction = run.interactions.find(item => item.status === 'pending')
+    assert.ok(interaction)
+    assert.equal(run.nodes[0]?.state, 'waiting')
+    assert.equal(run.nodes[0]?.attempts[0]?.status, 'paused')
+    run = await answerRunInteraction(run.id, interaction!.id, { optionId: 'staging' }) ?? run
+    run = await waitForRun(run.id, value => value.status === 'succeeded')
+    const resolved = run.interactions.find(item => item.id === interaction!.id)
+    assert.equal(resolved?.status, 'answered')
+    assert.deepEqual(resolved?.answer, { optionId: 'staging' })
+    assert.ok(run.artifacts.some(artifact => artifact.type === 'operator-response'))
+    assert.equal(run.nodes[0]?.attempts.length, 2)
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('rejecting a generic interaction cancels the run and downstream nodes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-run-interaction-reject-'))
+  const repository = join(root, 'fixture')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = join(root, 'state')
+  try {
+    await createGitFixture(repository, 'interaction-reject-fixture')
+    await importProject(repository)
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    configureRunManagerForTests({ codexRunner: async input => { await input.onInteraction?.({ kind: 'confirm', title: '确认继续', question: '是否继续执行？', required: true }); return '不应继续' } })
+    const started = await startRun({ nodes: [{ id: 'agent', kind: 'Agent', executorId: 'codex', outputType: 'agent-report' }, { id: 'next', kind: '验证', outputType: 'test-report' }], edges: [{ from: 'agent', to: 'next' }] })
+    let run = await waitForRun(started.id, value => value.status === 'awaiting_input')
+    const interaction = run.interactions.find(item => item.status === 'pending')
+    assert.ok(interaction)
+    run = await answerRunInteraction(run.id, interaction!.id, { decision: 'reject' }) ?? run
+    run = await waitForRun(run.id, value => value.status === 'cancelled')
+    assert.equal(run.interactions.find(item => item.id === interaction!.id)?.status, 'rejected')
+    assert.equal(run.nodes.find(node => node.id === 'agent')?.state, 'failed')
+    assert.equal(run.nodes.find(node => node.id === 'next')?.state, 'cancelled')
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('a Claude stream-json session streams thinking, tool calls, and results as public trace', async () => {
   const root = await mkdtemp(join(tmpdir(), 'artifact-claude-stream-'))
   const repository = join(root, 'fixture')
@@ -357,7 +609,7 @@ for (const line of lines) console.log(JSON.stringify(line))
     configureRunManagerForTests()
 
     const started = await startRun({ nodes: [{ id: 'claude-agent', kind: 'Agent', executorId: 'claude', outputType: 'agent-report', prompt: 'Inspect the fixture.' }] })
-    const run = await waitForRun(started.id, value => value.status === 'succeeded')
+    const run = await waitForRun(started.id, value => value.status === 'awaiting_delivery')
     const attempt = run.nodes[0]?.attempts[0]
     const argv = JSON.parse(await readFile(join(run.worktreePath!, 'received-argv.json'), 'utf8')) as string[]
     assert.deepEqual(argv.slice(0, 4), ['--print', '--output-format', 'stream-json', '--verbose'])

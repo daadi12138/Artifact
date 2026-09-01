@@ -10,15 +10,25 @@ export type CommandSpec = {
   command: string
   cwd: string
   timeoutMs: number
+  workspaceRoot?: string
+  evidence?: string[]
 }
 
 export const projectCommandKeys = ['install', 'test', 'build', 'typecheck', 'lint'] as const
 export type ProjectCommandKey = (typeof projectCommandKeys)[number]
 export type CommandApproval = CommandSpec & { approvedAt: string }
 
+export type WorkspaceRoot = {
+  path: string
+  ecosystem: 'node' | 'python' | 'go' | 'rust'
+  manager: string
+  evidence: string[]
+}
+
 export type ProjectEnvironment = {
   version: number
   detectedStack: Array<{ category: string; name: string; version?: string; evidence: string[] }>
+  workspaceRoots: WorkspaceRoot[]
   commands: Partial<Record<ProjectCommandKey, CommandSpec>>
   commandAllowlist: Partial<Record<ProjectCommandKey, CommandApproval>>
   confirmedByUser: boolean
@@ -226,37 +236,167 @@ export async function confirmProjectEnvironment(commands?: ProjectEnvironment['c
 export async function detectProjectEnvironment(gitRoot: string): Promise<ProjectEnvironment> {
   const detectedStack: ProjectEnvironment['detectedStack'] = [{ category: 'vcs', name: 'Git', evidence: ['.git'] }]
   const commands: ProjectEnvironment['commands'] = {}
-  try {
-    const packageJsonPath = join(gitRoot, 'package.json')
-    const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8')) as { packageManager?: string; dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: Record<string, string> }
-    const allDependencies = { ...packageJson.dependencies, ...packageJson.devDependencies }
-    detectedStack.push({ category: 'runtime', name: 'Node.js', evidence: ['package.json'] })
-    if (allDependencies.next) detectedStack.push({ category: 'framework', name: 'Next.js', version: allDependencies.next, evidence: ['package.json#dependencies.next'] })
-    if (allDependencies.typescript) detectedStack.push({ category: 'language', name: 'TypeScript', version: allDependencies.typescript, evidence: ['package.json#devDependencies.typescript'] })
-    const packageManager = packageJson.packageManager?.split('@')[0] ?? await detectPackageManager(gitRoot)
-    const run = packageManager === 'yarn' ? 'yarn' : `${packageManager} run`
-    const hasLockfile = packageManager === 'npm'
-      ? await fileExists(join(gitRoot, 'package-lock.json'))
-      : packageManager === 'pnpm'
-        ? await fileExists(join(gitRoot, 'pnpm-lock.yaml'))
-        : await fileExists(join(gitRoot, 'yarn.lock'))
-    const installCommand = packageManager === 'npm'
-      ? hasLockfile ? 'npm ci' : 'npm install'
-      : hasLockfile ? `${packageManager} install --frozen-lockfile` : `${packageManager} install`
-    commands.install = { command: installCommand, cwd: '.', timeoutMs: 600_000 }
-    for (const key of ['test', 'build', 'typecheck', 'lint'] as const) {
-      if (packageJson.scripts?.[key]) commands[key] = { command: `${run} ${key}`, cwd: '.', timeoutMs: 600_000 }
+  const workspaceRoots: WorkspaceRoot[] = []
+  const detections = await Promise.all([
+    detectNodeEnvironment(gitRoot),
+    detectPythonEnvironment(gitRoot),
+    detectGoEnvironment(gitRoot),
+    detectRustEnvironment(gitRoot),
+  ])
+  for (const detection of detections) {
+    detectedStack.push(...detection.detectedStack)
+    for (const workspaceRoot of detection.workspaceRoots) {
+      if (!workspaceRoots.some(current => current.path === workspaceRoot.path && current.ecosystem === workspaceRoot.ecosystem)) workspaceRoots.push(workspaceRoot)
     }
-  } catch {
-    // Non-Node projects remain importable and can be configured through the API.
+    // A repository can contain several ecosystems. Keep the first command for each
+    // validation kind so a single approval always maps to one explicit command.
+    for (const key of projectCommandKeys) if (!commands[key] && detection.commands[key]) commands[key] = detection.commands[key]
   }
-  return { version: 1, detectedStack, commands, commandAllowlist: {}, confirmedByUser: true, confirmedAt: new Date().toISOString() }
+  return { version: 1, detectedStack, workspaceRoots, commands, commandAllowlist: {}, confirmedByUser: true, confirmedAt: new Date().toISOString() }
+}
+
+type EnvironmentDetection = Pick<ProjectEnvironment, 'detectedStack' | 'workspaceRoots' | 'commands'>
+type PackageJson = { packageManager?: string; dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: Record<string, string>; workspaces?: unknown }
+
+const emptyDetection = (): EnvironmentDetection => ({ detectedStack: [], workspaceRoots: [], commands: {} })
+const commandSpec = (command: string, workspaceRoot: string, evidence: string[]): CommandSpec => ({ command, cwd: workspaceRoot, timeoutMs: 600_000, workspaceRoot, evidence })
+
+async function detectNodeEnvironment(gitRoot: string): Promise<EnvironmentDetection> {
+  const source = await readText(join(gitRoot, 'package.json'))
+  if (!source) return emptyDetection()
+  let packageJson: PackageJson
+  try { packageJson = JSON.parse(source) as PackageJson } catch { return emptyDetection() }
+  const allDependencies = { ...packageJson.dependencies, ...packageJson.devDependencies }
+  const packageManager = normalizePackageManager(packageJson.packageManager) ?? await detectPackageManager(gitRoot)
+  const hasPnpmWorkspace = await fileExists(join(gitRoot, 'pnpm-workspace.yaml'))
+  const workspaceEvidence = nodeWorkspaceEvidence(packageJson.workspaces, hasPnpmWorkspace)
+  const evidence = ['package.json', ...workspaceEvidence]
+  const detection = emptyDetection()
+  detection.detectedStack.push({ category: 'runtime', name: 'Node.js', evidence: ['package.json'] })
+  if (allDependencies.next) detection.detectedStack.push({ category: 'framework', name: 'Next.js', version: allDependencies.next, evidence: ['package.json#dependencies.next'] })
+  if (allDependencies.typescript) detection.detectedStack.push({ category: 'language', name: 'TypeScript', version: allDependencies.typescript, evidence: ['package.json#devDependencies.typescript'] })
+  detection.workspaceRoots.push({ path: '.', ecosystem: 'node', manager: packageManager, evidence })
+
+  const hasLockfile = packageManager === 'npm'
+    ? await fileExists(join(gitRoot, 'package-lock.json'))
+    : packageManager === 'pnpm'
+      ? await fileExists(join(gitRoot, 'pnpm-lock.yaml'))
+      : await fileExists(join(gitRoot, 'yarn.lock'))
+  const installCommand = packageManager === 'npm'
+    ? hasLockfile ? 'npm ci' : 'npm install'
+    : hasLockfile ? `${packageManager} install --frozen-lockfile` : `${packageManager} install`
+  detection.commands.install = commandSpec(installCommand, '.', [...evidence, hasLockfile ? `${packageManager} lockfile` : 'no lockfile'])
+  const run = packageManager === 'yarn' ? 'yarn' : `${packageManager} run`
+  for (const key of ['test', 'build', 'typecheck', 'lint'] as const) {
+    if (packageJson.scripts?.[key]) detection.commands[key] = commandSpec(`${run} ${key}`, '.', [...evidence, `package.json#scripts.${key}`])
+    else if (workspaceEvidence.length && (packageManager === 'npm' || packageManager === 'pnpm')) {
+      const command = packageManager === 'pnpm' ? `pnpm -r --if-present run ${key}` : `npm run ${key} --workspaces --if-present`
+      detection.commands[key] = commandSpec(command, '.', [...evidence, 'workspace package scripts'])
+    }
+  }
+  return detection
+}
+
+async function detectPythonEnvironment(gitRoot: string): Promise<EnvironmentDetection> {
+  const source = await readText(join(gitRoot, 'pyproject.toml'))
+  if (!source) return emptyDetection()
+  const detection = emptyDetection()
+  const pythonVersion = tomlAssignment(source, 'requires-python')
+  const evidence = ['pyproject.toml']
+  detection.detectedStack.push({ category: 'runtime', name: 'Python', version: pythonVersion, evidence })
+  detection.workspaceRoots.push({ path: '.', ecosystem: 'python', manager: pythonManager(source, await fileExists(join(gitRoot, 'uv.lock'))), evidence })
+  const manager = detection.workspaceRoots[0].manager
+  const dependencies = source.toLowerCase()
+  if (manager === 'uv') detection.commands.install = commandSpec('uv sync', '.', ['pyproject.toml', 'uv.lock'])
+  else if (manager === 'Poetry') detection.commands.install = commandSpec('poetry install', '.', ['pyproject.toml#tool.poetry'])
+  else if (await fileExists(join(gitRoot, 'requirements.txt'))) detection.commands.install = commandSpec('python3 -m pip install -r requirements.txt', '.', ['requirements.txt'])
+  else detection.commands.install = commandSpec('python3 -m pip install -e .', '.', ['pyproject.toml'])
+  if (tomlHasTable(source, 'tool.pytest.ini_options') || dependencies.includes('pytest')) detection.commands.test = commandSpec('python3 -m pytest', '.', ['pyproject.toml#pytest'])
+  if (tomlHasTable(source, 'tool.mypy') || dependencies.includes('mypy')) detection.commands.typecheck = commandSpec('python3 -m mypy .', '.', ['pyproject.toml#mypy'])
+  else if (tomlHasTable(source, 'tool.pyright') || dependencies.includes('pyright')) detection.commands.typecheck = commandSpec('python3 -m pyright', '.', ['pyproject.toml#pyright'])
+  if (tomlHasTable(source, 'tool.ruff') || dependencies.includes('ruff')) detection.commands.lint = commandSpec('python3 -m ruff check .', '.', ['pyproject.toml#ruff'])
+  else if (tomlHasTable(source, 'tool.flake8') || dependencies.includes('flake8')) detection.commands.lint = commandSpec('python3 -m flake8', '.', ['pyproject.toml#flake8'])
+  if (tomlHasTable(source, 'build-system')) detection.commands.build = commandSpec('python3 -m build', '.', ['pyproject.toml#build-system'])
+  return detection
+}
+
+async function detectGoEnvironment(gitRoot: string): Promise<EnvironmentDetection> {
+  const source = await readText(join(gitRoot, 'go.mod'))
+  if (!source) return emptyDetection()
+  const detection = emptyDetection()
+  const version = source.match(/^\s*go\s+([\d.]+)/m)?.[1]
+  const evidence = ['go.mod']
+  detection.detectedStack.push({ category: 'language', name: 'Go', version, evidence })
+  detection.workspaceRoots.push({ path: '.', ecosystem: 'go', manager: 'Go modules', evidence })
+  detection.commands.install = commandSpec('go mod download', '.', evidence)
+  detection.commands.test = commandSpec('go test ./...', '.', evidence)
+  detection.commands.build = commandSpec('go build ./...', '.', evidence)
+  return detection
+}
+
+async function detectRustEnvironment(gitRoot: string): Promise<EnvironmentDetection> {
+  const source = await readText(join(gitRoot, 'Cargo.toml'))
+  if (!source) return emptyDetection()
+  const detection = emptyDetection()
+  const version = tomlAssignmentInSection(source, 'package', 'rust-version')
+  const workspace = tomlHasTable(source, 'workspace')
+  const evidence = ['Cargo.toml', ...(workspace ? ['Cargo.toml#workspace'] : [])]
+  detection.detectedStack.push({ category: 'language', name: 'Rust', version, evidence })
+  detection.workspaceRoots.push({ path: '.', ecosystem: 'rust', manager: 'Cargo', evidence })
+  detection.commands.install = commandSpec('cargo fetch', '.', evidence)
+  detection.commands.typecheck = commandSpec('cargo check', '.', evidence)
+  detection.commands.test = commandSpec('cargo test', '.', evidence)
+  detection.commands.build = commandSpec('cargo build', '.', evidence)
+  if (source.toLowerCase().includes('clippy') || await fileExists(join(gitRoot, 'clippy.toml'))) detection.commands.lint = commandSpec('cargo clippy -- -D warnings', '.', [...evidence, 'clippy'])
+  return detection
+}
+
+function normalizePackageManager(value: string | undefined): 'npm' | 'pnpm' | 'yarn' | undefined {
+  const name = value?.split('@')[0]
+  return name === 'npm' || name === 'pnpm' || name === 'yarn' ? name : undefined
+}
+
+function nodeWorkspaceEvidence(workspaces: unknown, hasPnpmWorkspace: boolean): string[] {
+  const evidence: string[] = []
+  if (Array.isArray(workspaces) && workspaces.some(item => typeof item === 'string')) evidence.push('package.json#workspaces')
+  if (workspaces && typeof workspaces === 'object' && !Array.isArray(workspaces) && Array.isArray((workspaces as { packages?: unknown }).packages)) evidence.push('package.json#workspaces.packages')
+  if (hasPnpmWorkspace) evidence.push('pnpm-workspace.yaml')
+  return evidence
+}
+
+function tomlHasTable(source: string, table: string): boolean {
+  const escaped = table.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`^\\s*\\[${escaped}\\]\\s*$`, 'm').test(source)
+}
+
+function tomlAssignment(source: string, key: string): string | undefined {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = source.match(new RegExp(`^\\s*${escaped}\\s*=\\s*["']([^"']+)["']`, 'm'))
+  return match?.[1]
+}
+
+function tomlAssignmentInSection(source: string, section: string, key: string): string | undefined {
+  const escapedSection = section.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const match = source.match(new RegExp(`^\\s*\\[${escapedSection}\\]\\s*$([\\s\\S]*?)(?=^\\s*\\[[^\\]]+\\]\\s*$|(?![\\s\\S]))`, 'm'))
+  return match?.[1]?.match(new RegExp(`^\\s*${escapedKey}\\s*=\\s*["']([^"']+)["']`, 'm'))?.[1]
+}
+
+function pythonManager(source: string, hasUvLock: boolean): string {
+  if (hasUvLock || tomlHasTable(source, 'tool.uv')) return 'uv'
+  if (tomlHasTable(source, 'tool.poetry')) return 'Poetry'
+  return 'pip'
+}
+
+async function readText(path: string): Promise<string | null> {
+  try { return await readFile(path, 'utf8') } catch { return null }
 }
 
 function normalizeProject(project: ProjectConfig): ProjectConfig {
-  project.environment ??= { version: 1, detectedStack: [], commands: {}, commandAllowlist: {}, confirmedByUser: true }
+  project.environment ??= { version: 1, detectedStack: [], workspaceRoots: [], commands: {}, commandAllowlist: {}, confirmedByUser: true }
   project.environment.version ??= 1
   project.environment.detectedStack ??= []
+  project.environment.workspaceRoots ??= []
   project.environment.commands ??= {}
   project.environment.commandAllowlist ??= {}
   project.environment.confirmedByUser ??= true

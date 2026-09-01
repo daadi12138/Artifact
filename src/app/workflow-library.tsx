@@ -24,7 +24,7 @@ export type WorkflowRecordView = {
     definition: {
       id: string
       name: string
-      nodes: Array<{ id: string; kind: string; executorId?: string; prompt?: string; output: string }>
+      nodes: Array<{ id: string; kind: string; executorId?: string; executionMode?: 'read_only' | 'workspace_write'; prompt?: string; output: string }>
       edges: Array<{ from: string; to: string }>
     }
   }>

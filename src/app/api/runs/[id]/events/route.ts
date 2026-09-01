@@ -8,6 +8,7 @@ type StatePayload = {
   startedAt: string
   endedAt?: string
   pendingCommandApproval: RunSnapshot['pendingCommandApproval'] | null
+  interactions: RunSnapshot['interactions']
   logs: string[]
   nodes: Array<{
     id: string
@@ -32,6 +33,7 @@ function statePayload(run: RunSnapshot): StatePayload {
     startedAt: run.startedAt,
     ...(run.endedAt ? { endedAt: run.endedAt } : {}),
     pendingCommandApproval: run.pendingCommandApproval ?? null,
+    interactions: run.interactions ?? [],
     logs: run.logs ?? [],
     nodes: run.nodes.map(node => ({
       id: node.id,

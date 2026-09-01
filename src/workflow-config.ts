@@ -13,6 +13,7 @@ export type WorkflowCanvasNode = {
   input?: string
   output: string
   executorId?: string
+  executionMode?: 'read_only' | 'workspace_write'
   prompt?: string
 }
 
@@ -89,9 +90,9 @@ function canvas(nodes: WorkflowCanvasNode[], edges: WorkflowCanvasEdge[]): Workf
 
 export const defaultWorkflowDefinition = (): WorkflowCanvasDefinition => canvas([
   { id: 'requirement', title: '需求输入', subtitle: 'Requirement', kind: '输入', tone: 'blue', x: 48, y: 154, output: 'requirement', prompt: '描述需要在目标项目中完成的功能和验收标准。' },
-  { id: 'ui-spec', title: 'UI 规格', subtitle: 'UI Spec Agent', kind: 'Agent', tone: 'violet', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', prompt: '分析需求和现有项目，给出可执行的实现规格、风险与验证方法。' },
+  { id: 'ui-spec', title: 'UI 规格', subtitle: 'UI Spec Agent', kind: 'Agent', tone: 'violet', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', executionMode: 'read_only', prompt: '分析需求和现有项目，给出可执行的实现规格、风险与验证方法。' },
   { id: 'approval', title: '人工审批', subtitle: 'Human Approval', kind: '审批', tone: 'amber', x: 520, y: 154, input: 'ui-spec', output: 'approved-spec' },
-  { id: 'implementation', title: '实现代码', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', x: 756, y: 154, input: 'approval', output: 'code-change', executorId: 'codex', prompt: '按照已批准的规格在 Worktree 中实现代码，保持改动聚焦并运行相关检查。' },
+  { id: 'implementation', title: '实现代码', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', x: 756, y: 154, input: 'approval', output: 'code-change', executorId: 'codex', executionMode: 'workspace_write', prompt: '按照已批准的规格在 Worktree 中实现代码，保持改动聚焦并运行相关检查。' },
   { id: 'validation', title: '运行验证', subtitle: 'Confirmed Commands', kind: '验证', tone: 'green', x: 992, y: 154, input: 'implementation', output: 'test-report' },
   { id: 'review', title: '代码交付', subtitle: 'Git Diff', kind: '交付', tone: 'slate', x: 1228, y: 154, input: 'validation', output: 'git-diff' },
 ], [{ from: 'requirement', to: 'ui-spec' }, { from: 'ui-spec', to: 'approval' }, { from: 'approval', to: 'implementation' }, { from: 'implementation', to: 'validation' }, { from: 'validation', to: 'review' }])
@@ -99,8 +100,8 @@ export const defaultWorkflowDefinition = (): WorkflowCanvasDefinition => canvas(
 function codeReviewDefinition(): WorkflowCanvasDefinition {
   return canvas([
     { id: 'issue', title: '问题输入', subtitle: 'Issue', kind: '输入', tone: 'blue', x: 48, y: 154, output: 'requirement', prompt: '说明问题、预期行为、复现步骤和验收标准。' },
-    { id: 'investigation', title: '定位问题', subtitle: 'Investigation Agent', kind: 'Agent', tone: 'violet', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', prompt: '阅读相关代码，定位根因，说明影响范围和建议修复方案。' },
-    { id: 'implementation', title: '修复实现', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', x: 520, y: 154, input: 'ui-spec', output: 'code-change', executorId: 'codex', prompt: '按照定位结果完成最小范围修复，补充必要测试。' },
+    { id: 'investigation', title: '定位问题', subtitle: 'Investigation Agent', kind: 'Agent', tone: 'violet', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', executionMode: 'read_only', prompt: '阅读相关代码，定位根因，说明影响范围和建议修复方案。' },
+    { id: 'implementation', title: '修复实现', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', x: 520, y: 154, input: 'ui-spec', output: 'code-change', executorId: 'codex', executionMode: 'workspace_write', prompt: '按照定位结果完成最小范围修复，补充必要测试。' },
     { id: 'review', title: '审核 Diff', subtitle: 'Human Review', kind: '审批', tone: 'amber', x: 756, y: 154, input: 'code-change', output: 'approved-spec' },
     { id: 'validation', title: '验证修复', subtitle: 'Confirmed Commands', kind: '验证', tone: 'green', x: 992, y: 154, input: 'approved-spec', output: 'test-report' },
     { id: 'delivery', title: '交付报告', subtitle: 'Git Diff', kind: '交付', tone: 'slate', x: 1228, y: 154, input: 'test-report', output: 'git-diff' },
@@ -110,8 +111,8 @@ function codeReviewDefinition(): WorkflowCanvasDefinition {
 function uiImplementationDefinition(): WorkflowCanvasDefinition {
   return canvas([
     { id: 'brief', title: '多模态需求', subtitle: 'Brief + References', kind: '输入', tone: 'blue', x: 48, y: 154, output: 'requirement', prompt: '描述页面目标、交互要求，并附上图片、参考链接或媒体资源。' },
-    { id: 'ui-spec', title: '界面规格', subtitle: 'UI Spec Agent', kind: 'Agent', tone: 'violet', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', prompt: '从需求和参考资料提炼界面结构、关键状态、视觉约束和验收方法。' },
-    { id: 'implementation', title: '实现界面', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', x: 520, y: 154, input: 'ui-spec', output: 'code-change', executorId: 'codex', prompt: '在 Worktree 中实现界面，保持项目现有设计系统与交互习惯一致。' },
+    { id: 'ui-spec', title: '界面规格', subtitle: 'UI Spec Agent', kind: 'Agent', tone: 'violet', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', executionMode: 'read_only', prompt: '从需求和参考资料提炼界面结构、关键状态、视觉约束和验收方法。' },
+    { id: 'implementation', title: '实现界面', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', x: 520, y: 154, input: 'ui-spec', output: 'code-change', executorId: 'codex', executionMode: 'workspace_write', prompt: '在 Worktree 中实现界面，保持项目现有设计系统与交互习惯一致。' },
     { id: 'review', title: '审核变更', subtitle: 'Human Review', kind: '审批', tone: 'amber', x: 756, y: 154, input: 'code-change', output: 'approved-spec' },
     { id: 'validation', title: '运行验证', subtitle: 'Confirmed Commands', kind: '验证', tone: 'green', x: 992, y: 154, input: 'approved-spec', output: 'test-report' },
     { id: 'delivery', title: '交付结果', subtitle: 'Git Diff', kind: '交付', tone: 'slate', x: 1228, y: 154, input: 'test-report', output: 'git-diff' },
@@ -278,6 +279,7 @@ export function validateWorkflowDefinition(value: WorkflowCanvasDefinition): voi
     if (!node || typeof node.id !== 'string' || !node.id.trim()) throw new Error('Every node needs an id')
     if (ids.has(node.id)) throw new Error(`Duplicate node id: ${node.id}`)
     if (typeof node.title !== 'string' || typeof node.kind !== 'string' || typeof node.output !== 'string') throw new Error(`Invalid node: ${node.id}`)
+    if (node.executionMode !== undefined && node.executionMode !== 'read_only' && node.executionMode !== 'workspace_write') throw new Error(`Invalid execution mode: ${node.id}`)
     if (!Number.isFinite(node.x) || !Number.isFinite(node.y)) throw new Error(`Invalid position: ${node.id}`)
     ids.add(node.id)
   }

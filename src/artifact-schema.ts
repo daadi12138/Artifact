@@ -21,6 +21,9 @@ const reportSchema = (id: string): JsonSchema => ({
 const schemas = new Map<string, JsonSchema>([
   ['requirement', reportSchema('artifact://schemas/requirement')],
   ['run-input', reportSchema('artifact://schemas/run-input')],
+  ['intent-spec', reportSchema('artifact://schemas/intent-spec')],
+  ['repository-map', reportSchema('artifact://schemas/repository-map')],
+  ['execution-plan', reportSchema('artifact://schemas/execution-plan')],
   ['operator-note', reportSchema('artifact://schemas/operator-note')],
   ['ui-spec', reportSchema('artifact://schemas/ui-spec')],
   ['approved-spec', reportSchema('artifact://schemas/approved-spec')],

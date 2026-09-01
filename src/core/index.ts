@@ -2,6 +2,7 @@ export {
   approveProjectCommand,
   confirmProjectEnvironment,
   createProject,
+  detectProjectEnvironment,
   diagnoseProject,
   importProject,
   isProjectCommandApproved,
@@ -17,6 +18,7 @@ export {
   type ProjectDiagnostic,
   type ProjectEnvironment,
   type RecentProject,
+  type WorkspaceRoot,
 } from '../project'
 
 export {
@@ -58,12 +60,14 @@ export {
 
 export {
   approveRun,
+  answerRunInteraction,
   cancelRun,
   getRun,
   listRuns,
   pauseRun,
   readArtifactPayload,
   rejectRun,
+  requestRunInteraction,
   requestDeliveryApproval,
   resumeRun,
   resumeInterruptedRuns,
@@ -73,6 +77,10 @@ export {
   validateRunGraph,
   type AgentPromptSnapshot,
   type AgentTraceEvent,
+  type HumanInteractionKind,
+  type HumanInteractionOption,
+  type HumanInteractionRequest,
+  type HumanInteractionSource,
   type RunEvent,
   type RunInput,
   type RunInputAttachment,
@@ -81,8 +89,32 @@ export {
 } from '../run-manager'
 
 export {
+  buildRepositoryMap,
+  intentPrompt,
+  orchestrationReviewReason,
+  parseIntentModelOutput,
+  runStateGraph,
+  textualAttachmentContext,
+  type ExecutionPlan,
+  type IntentOrchestrationSnapshot,
+  type IntentSpec,
+  type IntentTaskType,
+  type RepositoryMap,
+} from '../intelligent-orchestration'
+
+export {
   subscribeRunEvents,
   type RunChangedListener,
 } from '../run-events'
+
+export {
+  cleanupStorage,
+  getStorageOverview,
+  previewStorageCleanup,
+  type StorageCleanupPreview,
+  type StorageCleanupResult,
+  type StorageOverview,
+  type StorageRunUsage,
+} from '../storage-management'
 
 export { schemaFor, validatePayload, type JsonSchema } from '../artifact-schema'

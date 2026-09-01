@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
-import { AlertTriangle, ArrowLeft, ArrowUp, Check, Copy, Download, ExternalLink, Moon, RefreshCw, ScanSearch, Sun } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ArrowUp, Check, Copy, Download, ExternalLink, HardDrive, Moon, RefreshCw, ScanSearch, Sun, Trash2 } from 'lucide-react'
 
 type ExecutorEnvironmentState = 'ready' | 'discovered' | 'update_available' | 'not_installed' | 'error'
 type ExecutorAuthenticationState = 'authenticated' | 'api_key' | 'needs_login' | 'unknown'
@@ -10,10 +10,12 @@ type ExecutorModelCatalog = { source: 'codex-cli-catalog' | 'claude-cli-help'; d
 type ExecutorEnvironment = { id: string; name: string; type: string; icon: string; tone: string; command: string; platform: string; state: ExecutorEnvironmentState; connected: boolean; executablePath?: string; currentVersion?: string; latestVersion?: string; error?: string; installPlan?: { display: string }; model: string; modelOptions: ExecutorModelOption[]; modelCatalog?: ExecutorModelCatalog; authentication: ExecutorAuthenticationState }
 type ExecutorEnvironmentReport = { scannedAt: string; executors: ExecutorEnvironment[]; updateCount: number }
 type ExecutorInstallationDiagnostic = { checkedAt: string; conflicts: Array<{ id: string; name: string; command: string; paths: string[] }> }
-type CommandSpec = { command: string; cwd: string; timeoutMs: number }
+type CommandSpec = { command: string; cwd: string; timeoutMs: number; workspaceRoot?: string; evidence?: string[] }
 type CommandApproval = CommandSpec & { approvedAt: string }
-type Project = { name: string; repositoryPath: string; gitRoot: string; status: string; environment: { version: number; confirmedByUser: boolean; detectedStack: Array<{ name: string; version?: string }>; commands: Record<string, CommandSpec | undefined>; commandAllowlist: Record<string, CommandApproval | undefined> } }
+type Project = { name: string; repositoryPath: string; gitRoot: string; status: string; environment: { version: number; confirmedByUser: boolean; detectedStack: Array<{ name: string; version?: string }>; workspaceRoots?: Array<{ path: string; ecosystem: string; manager: string; evidence: string[] }>; commands: Record<string, CommandSpec | undefined>; commandAllowlist: Record<string, CommandApproval | undefined> } }
 type RecentProject = Pick<Project, 'name' | 'repositoryPath' | 'gitRoot'> & { updatedAt: string }
+type StorageOverview = { stateDirectory: string; runsDirectory: string; worktreesDirectory: string; retainedArtifactsDirectory: string; totalBytes: number; runBytes: number; attemptBytes: number; artifactBytes: number; worktreeBytes: number; retainedArtifactBytes: number; cleanupEligibleCount: number; protectedRunCount: number }
+type StorageCleanupPreview = { runIds: string[]; protectedRunIds: string[]; totalBytes: number; artifactBytes: number; reclaimedBytes: number; retainArtifacts: boolean }
 const commandKeys = ['install', 'typecheck', 'test', 'build', 'lint'] as const
 const commandLabels: Record<(typeof commandKeys)[number], string> = { install: '安装依赖', typecheck: '类型检查', test: '运行测试', build: '生产构建', lint: '代码检查' }
 const futureExecutors = [
@@ -69,6 +71,13 @@ function FeedbackToast({ notice }: { notice: FeedbackNoticeState | null }) {
   </div>
 }
 
+function formatBytes(value: number): string {
+  if (value < 1_024) return `${value} B`
+  if (value < 1_024 * 1_024) return `${(value / 1_024).toFixed(1)} KB`
+  if (value < 1_024 * 1_024 * 1_024) return `${(value / (1_024 * 1_024)).toFixed(1)} MB`
+  return `${(value / (1_024 * 1_024 * 1_024)).toFixed(1)} GB`
+}
+
 export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigured, theme, onThemeChange }: SettingsOverviewProps) {
   const [project, setProject] = useState<Project | null>(null)
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([])
@@ -80,9 +89,27 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useTransientNotice()
   const [desktop, setDesktop] = useState(false)
+  const [storage, setStorage] = useState<StorageOverview | null>(null)
+  const [storageLoading, setStorageLoading] = useState(true)
+  const [storageBusy, setStorageBusy] = useState(false)
+  const [retainArtifacts, setRetainArtifacts] = useState(true)
   const load = () => { void fetch('/api/project').then(response => response.json()).then((value: { project: Project | null; recentProjects?: RecentProject[] }) => { setProject(value.project); setRecentProjects(value.recentProjects ?? []); setPath(''); setNewProjectLocation(''); if (value.project) setActiveStep(3) }).catch(() => undefined) }
+  const loadStorage = async (showError = false) => {
+    setStorageLoading(true)
+    try {
+      const response = await fetch('/api/storage')
+      const value = await response.json() as StorageOverview & { error?: string }
+      if (!response.ok) throw new Error(value.error ?? '无法读取运行存储')
+      setStorage(value)
+    } catch (error) {
+      if (showError) setNotice({ kind: 'error', text: error instanceof Error ? error.message : '无法读取运行存储' })
+    } finally {
+      setStorageLoading(false)
+    }
+  }
   useEffect(() => { setDesktop(Boolean(window.artifactDesktop)) }, [])
   useEffect(load, [])
+  useEffect(() => { void loadStorage() }, [])
   const acceptProject = (value: Project) => { setProject(value); setPath(''); setProjectMode('idle'); setActiveStep(3); setRecentProjects(current => [{ name: value.name, repositoryPath: value.repositoryPath, gitRoot: value.gitRoot, updatedAt: new Date().toISOString() }, ...current.filter(item => item.gitRoot !== value.gitRoot)].slice(0, 6)); setNotice({ kind: 'success', text: '项目已导入。确认本机运行时状态后即可开始工作流；命令会在实际运行前按需请求授权。' }); window.dispatchEvent(new Event('artifact-project-updated')) }
   const pickProject = async () => {
     if (!window.artifactDesktop) return
@@ -153,6 +180,30 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
       window.dispatchEvent(new Event('artifact-project-updated'))
     } catch (error) { setNotice({ kind: 'error', text: error instanceof Error ? error.message : '命令白名单更新失败' }) } finally { setBusy(false) }
   }
+  const cleanupCompletedRuns = async () => {
+    setStorageBusy(true)
+    setNotice(null)
+    try {
+      const previewResponse = await fetch('/api/storage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'preview', retainArtifacts }) })
+      const preview = await previewResponse.json() as StorageCleanupPreview & { error?: string }
+      if (!previewResponse.ok) throw new Error(preview.error ?? '无法预览清理范围')
+      if (!preview.runIds.length) {
+        setNotice({ kind: 'success', text: '当前没有可清理的已结束运行。等待交付审批和未结束运行会继续保留。' })
+        return
+      }
+      const artifactNote = retainArtifacts ? `运行产物将保留，预计释放 ${formatBytes(preview.reclaimedBytes)}。` : `预计释放 ${formatBytes(preview.reclaimedBytes)}，运行产物也会删除。`
+      if (!window.confirm(`将清理 ${preview.runIds.length} 个已结束运行。${artifactNote}\n\n等待交付审批和未结束运行不会被清理。`)) return
+      const cleanupResponse = await fetch('/api/storage', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'cleanup', runIds: preview.runIds, retainArtifacts }) })
+      const result = await cleanupResponse.json() as { cleanedRunIds?: string[]; error?: string }
+      if (!cleanupResponse.ok) throw new Error(result.error ?? '运行存储清理失败')
+      setNotice({ kind: 'success', text: `已清理 ${result.cleanedRunIds?.length ?? 0} 个已结束运行。${retainArtifacts ? '运行产物已保留在 retained-artifacts 中。' : ''}` })
+      await loadStorage()
+    } catch (error) {
+      setNotice({ kind: 'error', text: error instanceof Error ? error.message : '运行存储清理失败' })
+    } finally {
+      setStorageBusy(false)
+    }
+  }
   const detectedCommands = commandKeys.flatMap(key => project?.environment.commands[key] ? [[key, project.environment.commands[key]!] as const] : [])
 
   const completedSteps = Number(Boolean(project)) + Number(executorConfigured)
@@ -212,7 +263,7 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
 
         <div className="setup-stage-content" key={activeStep}>
           {activeStep === 1 && (project ? <>
-            <div className="setup-project-summary"><span className="setup-summary-icon">✓</span><div><strong>{project.name}</strong><small>项目已识别。确认本机运行时后即可运行；验证命令会在首次实际使用前请求授权。</small><div className="setup-stack-list">{project.environment.detectedStack.map(item => <span key={item.name}>{item.name}{item.version ? ` ${item.version}` : ''}</span>)}</div></div></div>
+            <div className="setup-project-summary"><span className="setup-summary-icon">✓</span><div><strong>{project.name}</strong><small>项目已识别。确认本机运行时后即可运行；验证命令会在首次实际使用前请求授权。</small><div className="setup-stack-list">{project.environment.detectedStack.map(item => <span key={`${item.name}-${item.version ?? ''}`}>{item.name}{item.version ? ` ${item.version}` : ''}</span>)}{project.environment.workspaceRoots?.map(root => <span key={`${root.ecosystem}-${root.path}`} title={root.evidence.join(' · ')}>{root.manager} · {root.path}</span>)}</div></div></div>
             <div className="setup-stage-actions"><button className="run-btn" onClick={() => setActiveStep(3)}>查看运行时</button><button className="ghost-btn" onClick={() => setActiveStep(2)}>管理命令白名单</button><button className="ghost-btn" onClick={() => void (desktop ? pickProject() : setProjectMode('manual-import'))} disabled={busy}>更换项目</button>{desktop && <button className="text-btn" onClick={() => void window.artifactDesktop?.showItem(project.gitRoot)}>在 Finder 中显示</button>}</div>
           </> : <>
             <div className="setup-choice-copy"><h3>从一个 Git 项目开始</h3><p>Artifact 会读取仓库信息并建议可执行命令；每次运行都将在隔离 Worktree 中完成。</p></div>
@@ -227,13 +278,41 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
             <div className="setup-command-heading"><div><h3>命令白名单</h3><p>无需在导入时做选择。工作流需要运行某条命令时会暂停并显示完整命令；授权后，相同命令会自动执行。</p></div></div>
             {detectedCommands.length > 0 ? <div className="setup-command-list">{detectedCommands.map(([key, command]) => {
               const approval = project.environment.commandAllowlist[key]
-              return <div className="setup-command" key={key}><span><b>{commandLabels[key]}</b><code>{command.command}</code><small>{approval ? `已允许 · ${new Date(approval.approvedAt).toLocaleString('zh-CN')}` : '首次运行时请求授权'}</small></span><button className={approval ? 'ghost-btn' : 'run-btn'} onClick={() => void manageCommand(key, approval ? 'revoke' : 'allow')} disabled={busy}>{approval ? '撤销允许' : '允许执行'}</button></div>
-            })}</div> : <div className="setup-empty"><b>尚未检测到项目命令</b><span>Artifact 目前会识别 Node 项目的 install、typecheck、test、build 和 lint 脚本。</span></div>}
+              const workspace = command.workspaceRoot ?? command.cwd
+              const origin = command.evidence?.join(' · ')
+              return <div className="setup-command" key={key}><span><b>{commandLabels[key]}</b><code>{command.command}</code><small title={origin}>{approval ? `已允许 · ${new Date(approval.approvedAt).toLocaleString('zh-CN')}` : '首次运行时请求授权'} · 工作区 {workspace}</small></span><button className={approval ? 'ghost-btn' : 'run-btn'} onClick={() => void manageCommand(key, approval ? 'revoke' : 'allow')} disabled={busy}>{approval ? '撤销允许' : '允许执行'}</button></div>
+            })}</div> : <div className="setup-empty"><b>尚未检测到项目命令</b><span>Artifact 会识别 Node、Python、Go 和 Rust 项目的常用验证命令。</span></div>}
             <div className="setup-stage-actions"><button className="run-btn" onClick={() => setActiveStep(3)}>查看运行时</button><span>命令白名单可随时回来管理。</span></div>
           </>}
 
           {activeStep === 3 && project && <><div className={`setup-executor-status ${executorConfigured ? 'ready' : ''}`}><span>{executorConfigured ? '✓' : '✦'}</span><div><h3>{executorConfigured ? '运行时已发现' : '未发现可用运行时'}</h3><p>{executorConfigured ? '项目与本机运行时均已就绪，可以开始第一个工作流。验证命令将在首次使用时请求授权。' : '安装并登录 Codex 或 Claude Code 后，返回此处刷新状态。'}</p></div></div><div className="setup-stage-actions"><button className="run-btn" onClick={executorConfigured ? onOpenWorkflow : onExecutors}>{executorConfigured ? '进入工作流' : '查看运行时'}</button>{executorConfigured && <button className="ghost-btn" onClick={onExecutors}>查看运行时</button>}</div></>}
         </div>
+      </section>
+
+      <section className="storage-governance" aria-labelledby="storage-governance-title">
+        <header className="storage-governance-heading">
+          <div className="storage-heading-copy"><span className="storage-heading-icon"><HardDrive aria-hidden="true" /></span><div><span className="section-kicker">RUN STORAGE</span><h2 id="storage-governance-title">运行存储</h2><p>运行记录、验证输出和隔离 Worktree 都保存在本机。</p></div></div>
+          <button className="ghost-btn" onClick={() => void loadStorage(true)} disabled={storageLoading || storageBusy}><RefreshCw className={storageLoading ? 'spin' : undefined} aria-hidden="true" />{storageLoading ? '读取中…' : '刷新'}</button>
+        </header>
+        {storage ? <>
+          <div className="storage-metrics">
+            <div className="storage-primary-metric"><span><small>Artifact 存储</small><b>{formatBytes(storage.totalBytes)}</b><em>运行记录、输出与 Worktree</em></span></div>
+            <div><span><small>可清理运行</small><b>{storage.cleanupEligibleCount}</b><em>已结束</em></span></div>
+            <div className="storage-protected-metric"><span><small>受保护运行</small><b>{storage.protectedRunCount}</b><em>{storage.protectedRunCount ? '不会被清理' : '当前无保护项'}</em></span></div>
+            <div><span><small>隔离 Worktree</small><b>{formatBytes(storage.worktreeBytes)}</b><em>可随运行回收</em></span></div>
+          </div>
+          <div className="storage-paths">
+            <div className="storage-paths-heading"><span>本机位置</span><small>路径仅用于查看，运行数据始终保留在本机。</small></div>
+            <span><small>状态目录</small><code title={storage.stateDirectory}>{storage.stateDirectory}</code></span>
+            <span><small>Worktree 目录</small><code title={storage.worktreesDirectory}>{storage.worktreesDirectory}</code></span>
+            <span><small>保留产物目录</small><code title={storage.retainedArtifactsDirectory}>{storage.retainedArtifactsDirectory}</code></span>
+          </div>
+          <div className="storage-cleanup-actions">
+            <div className="storage-cleanup-copy"><b>清理策略</b><small>等待交付审批、运行中与暂停中的记录始终受保护。</small></div>
+            <label className="storage-retention"><input type="checkbox" checked={retainArtifacts} onChange={event => setRetainArtifacts(event.target.checked)} disabled={storageBusy} /><span><b>保留运行产物</b><small>复制产物与运行清单，不保留 Worktree。</small></span></label>
+            <button className="ghost-btn storage-cleanup-button" onClick={() => void cleanupCompletedRuns()} disabled={storageBusy || storage.cleanupEligibleCount === 0}><Trash2 aria-hidden="true" /><span>{storageBusy ? '清理中…' : '清理已结束运行'}</span></button>
+          </div>
+        </> : <div className="storage-empty">{storageLoading ? '正在读取运行存储…' : '暂时无法读取运行存储。'}</div>}
       </section>
 
       <section className="appearance-theme" aria-labelledby="appearance-theme-title">

@@ -7,7 +7,7 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json() as {
-      nodes?: Array<{ id: string; kind: string; executorId?: string; prompt?: string; outputType?: string }>
+      nodes?: Array<{ id: string; kind: string; executorId?: string; executionMode?: 'read_only' | 'workspace_write'; prompt?: string; outputType?: string }>
       edges?: Array<{ from: string; to: string }>
       input?: RunInput
       workflow?: Partial<WorkflowRunReference>
@@ -24,10 +24,11 @@ export async function POST(request: Request) {
         id: node.id,
         kind: node.kind,
         executorId: node.executorId,
+        executionMode: node.executionMode,
         prompt: node.prompt,
         outputType: node.output,
       }))
-      return Response.json(await startRun({ nodes, edges: published.definition.edges, input: body.input, workflow }), { status: 201 })
+      return Response.json(await startRun({ nodes, edges: published.definition.edges, input: body.input, workflow, intentAware: true }), { status: 201 })
     }
     if (!body.nodes?.length) throw new Error('nodes are required')
     return Response.json(await startRun({ nodes: body.nodes, edges: body.edges ?? [], input: body.input }), { status: 201 })

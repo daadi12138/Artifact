@@ -2,14 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
-import { AlignHorizontalSpaceAround, Bot, Check, ChevronLeft, ChevronRight, Copy, Download, Ellipsis, Eye, Focus, FolderCog, History, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, Upload, Workflow, X } from 'lucide-react'
+import { AlignHorizontalSpaceAround, Bot, Check, ChevronLeft, ChevronRight, Copy, Download, Ellipsis, Eye, Focus, FolderCog, History, LoaderCircle, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, Upload, Workflow, X } from 'lucide-react'
 import artifactLogo from './assets/artifact-logo.png'
 import { ExecutorSettings, SettingsOverview } from './executor-settings'
 import { latestActivity, RunWorkspace, type RunWorkspaceRun } from './run-workspace'
 import { WorkflowLibraryView, type WorkflowRecordView, type WorkflowTemplateView } from './workflow-library'
 
 type NodeState = 'idle' | 'running' | 'paused' | 'success' | 'waiting' | 'failed' | 'cancelled' | 'skipped'
-type WorkflowNode = { id: string; title: string; subtitle: string; kind: string; tone: string; state: NodeState; x: number; y: number; input?: string; output: string; executorId?: string; prompt?: string }
+type WorkflowNode = { id: string; title: string; subtitle: string; kind: string; tone: string; state: NodeState; x: number; y: number; input?: string; output: string; executorId?: string; executionMode?: 'read_only' | 'workspace_write'; prompt?: string }
 type Edge = { from: string; to: string }
 type CommandSpec = { command: string; cwd: string; timeoutMs: number }
 type CommandApproval = CommandSpec & { approvedAt: string }
@@ -18,7 +18,7 @@ type ExecutorOption = { id: string; name: string; connected: boolean; authentica
 type Artifact = { id: string; nodeId: string; type: string; version?: number; schemaId?: string; schemaVersion?: number; status: string; contentHash: string; createdAt: string; inputArtifactIds?: string[]; validationErrors?: string[] }
 type Attempt = { id: string; attempt: number; status: string; startedAt?: string; endedAt?: string; exitReason?: string; trace?: Array<{ seq: number; occurredAt: string; kind: string; toolName?: string; content?: string; command?: string }> }
 type PendingCommandApproval = { nodeId: string; commandKey: string; command: CommandSpec; requestedAt: string }
-type Run = { id: string; status: string; startedAt: string; endedAt?: string; worktreePath?: string; branchName?: string; pendingCommandApproval?: PendingCommandApproval; logs: string[]; nodes: Array<{ id: string; state: string; attempts?: Attempt[] }>; artifacts: Artifact[] }
+type Run = { id: string; status: string; startedAt: string; endedAt?: string; worktreePath?: string; branchName?: string; workflow?: { workflowId: string; workflowName: string; revision: number; publishedAt: string }; pendingCommandApproval?: PendingCommandApproval; logs: string[]; nodes: Array<{ id: string; kind?: string; outputType?: string; state: string; attempts?: Attempt[] }>; artifacts: Artifact[] }
 type RunHeaderContext = Pick<RunWorkspaceRun, 'id' | 'status' | 'branchName' | 'workflow'>
 type DragState = { id: string; dx: number; dy: number; startX: number; startY: number; finalX: number; finalY: number; pointerStartX: number; pointerStartY: number; moved: boolean; element: HTMLButtonElement }
 type CanvasViewport = { x: number; y: number; zoom: number }
@@ -52,6 +52,7 @@ function editorNodes(value: unknown): WorkflowNode[] {
       input: typeof node.input === 'string' ? node.input : undefined,
       output: typeof node.output === 'string' && node.output.trim() ? node.output : 'artifact',
       executorId: typeof node.executorId === 'string' ? node.executorId : undefined,
+      executionMode: node.executionMode === 'read_only' || node.executionMode === 'workspace_write' ? node.executionMode : undefined,
       prompt: typeof node.prompt === 'string' ? node.prompt : undefined,
     }]
   })
@@ -68,15 +69,15 @@ function editorEdges(value: unknown, nodeIds: Set<string>): Edge[] {
 
 const initialNodes: WorkflowNode[] = [
   { id: 'requirement', title: '需求输入', subtitle: 'Requirement', kind: '输入', tone: 'blue', state: 'idle', x: 48, y: 154, output: 'requirement', prompt: '描述需要在目标项目中完成的功能和验收标准。' },
-  { id: 'ui-spec', title: 'UI 规格', subtitle: 'UI Spec Agent', kind: 'Agent', tone: 'violet', state: 'idle', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', prompt: '分析需求和现有项目，给出可执行的实现规格、风险与验证方法。' },
+  { id: 'ui-spec', title: 'UI 规格', subtitle: 'UI Spec Agent', kind: 'Agent', tone: 'violet', state: 'idle', x: 284, y: 154, input: 'requirement', output: 'ui-spec', executorId: 'codex', executionMode: 'read_only', prompt: '分析需求和现有项目，给出可执行的实现规格、风险与验证方法。' },
   { id: 'approval', title: '人工审批', subtitle: 'Human Approval', kind: '审批', tone: 'amber', state: 'idle', x: 520, y: 154, input: 'ui-spec', output: 'approved-spec' },
-  { id: 'implementation', title: '实现代码', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', state: 'idle', x: 756, y: 154, input: 'approval', output: 'code-change', executorId: 'codex', prompt: '按照已批准的规格在 Worktree 中实现代码，保持改动聚焦并运行相关检查。' },
+  { id: 'implementation', title: '实现代码', subtitle: 'Coding Agent', kind: 'Agent', tone: 'violet', state: 'idle', x: 756, y: 154, input: 'approval', output: 'code-change', executorId: 'codex', executionMode: 'workspace_write', prompt: '按照已批准的规格在 Worktree 中实现代码，保持改动聚焦并运行相关检查。' },
   { id: 'validation', title: '运行验证', subtitle: 'Confirmed Commands', kind: '验证', tone: 'green', state: 'idle', x: 992, y: 154, input: 'implementation', output: 'test-report' },
   { id: 'review', title: '代码交付', subtitle: 'Git Diff', kind: '交付', tone: 'slate', state: 'idle', x: 1228, y: 154, input: 'validation', output: 'git-diff' },
 ]
 const initialEdges: Edge[] = [{ from: 'requirement', to: 'ui-spec' }, { from: 'ui-spec', to: 'approval' }, { from: 'approval', to: 'implementation' }, { from: 'implementation', to: 'validation' }, { from: 'validation', to: 'review' }]
 const navItems = [{ id: 'workflow', label: '工作流', icon: Workflow }, { id: 'runs', label: '运行', icon: History }, { id: 'artifacts', label: 'Artifacts', icon: Package }, { id: 'settings', label: '项目设置', icon: Settings }]
-const nodePresets = [{ kind: 'Agent', title: 'Agent 节点', subtitle: 'Custom Agent', tone: 'violet', output: 'agent-report' }, { kind: '验证', title: '验证节点', subtitle: 'Confirmed Commands', tone: 'green', output: 'test-report' }, { kind: '审批', title: '审批节点', subtitle: 'Human Approval', tone: 'amber', output: 'approved-spec' }, { kind: '工具', title: '工具节点', subtitle: 'Local Tool', tone: 'blue', output: 'tool-result' }]
+const nodePresets = [{ kind: 'Agent', title: 'Agent 节点', subtitle: 'Custom Agent', tone: 'violet', output: 'agent-report', executionMode: 'read_only' as const }, { kind: '验证', title: '验证节点', subtitle: 'Confirmed Commands', tone: 'green', output: 'test-report' }, { kind: '审批', title: '审批节点', subtitle: 'Human Approval', tone: 'amber', output: 'approved-spec' }, { kind: '工具', title: '工具节点', subtitle: 'Local Tool', tone: 'blue', output: 'tool-result' }]
 const outputSchemas = ['requirement', 'ui-spec', 'approved-spec', 'agent-report', 'code-change', 'test-report', 'git-diff', 'tool-result']
 const defaultSidebarWidth = 218
 const minSidebarWidth = 190
@@ -93,6 +94,7 @@ const maxInspectorWidth = 480
 const defaultLogPanelHeight = 165
 const minLogPanelHeight = 132
 const maxLogPanelHeight = 420
+const activeViewStorageKey = 'artifact.active-view'
 
 function isTextEntryTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && (target.isContentEditable || Boolean(target.closest('input, textarea, select, [contenteditable="true"]')))
@@ -179,6 +181,7 @@ export default function HomePage() {
   const [executorOptions, setExecutorOptions] = useState<ExecutorOption[]>([])
   const [executorsLoaded, setExecutorsLoaded] = useState(false)
   const [project, setProject] = useState<ProjectSummary | null>(null)
+  const [projectLoading, setProjectLoading] = useState(true)
   const [workflows, setWorkflows] = useState<WorkflowRecordView[]>([])
   const [templates, setTemplates] = useState<WorkflowTemplateView[]>([])
   const [workflowMode, setWorkflowMode] = useState<WorkflowMode>('library')
@@ -213,7 +216,7 @@ export default function HomePage() {
   const selected = nodes.find(node => node.id === selectedId)
   const selectedWorkflow = useMemo(() => workflows.find(workflow => workflow.id === selectedWorkflowId) ?? null, [selectedWorkflowId, workflows])
   const completed = useMemo(() => nodes.filter(node => node.state === 'success').length, [nodes])
-  const projectName = project?.name ?? '未导入项目'
+  const projectName = projectLoading ? '读取中…' : project?.name ?? '未导入项目'
 
   useEffect(() => {
     const savedTheme = window.localStorage.getItem('artifact.theme')
@@ -453,10 +456,12 @@ export default function HomePage() {
   }
 
   const loadProject = useCallback(() => {
+    setProjectLoading(true)
     void fetch('/api/project')
       .then(response => response.ok ? response.json() : null)
       .then((value: { project?: ProjectSummary | null } | null) => setProject(value?.project ?? null))
       .catch(() => setProject(null))
+      .finally(() => setProjectLoading(false))
   }, [])
 
   const loadExecutors = useCallback(() => {
@@ -585,7 +590,7 @@ export default function HomePage() {
     setRunHeaderContext(current => current?.id === run.id ? { ...current, status: run.status, branchName: run.branchName } : current)
     setPendingCommandApproval(run.pendingCommandApproval ?? null)
     setLogs(run.logs)
-    setRunning(['running', 'preparing', 'awaiting_approval'].includes(run.status))
+    setRunning(['running', 'preparing', 'awaiting_input', 'awaiting_approval', 'awaiting_delivery'].includes(run.status))
     setNodes(current => current.map(node => ({ ...node, state: run.nodes.find(item => item.id === node.id)?.state as NodeState ?? node.state })))
     setNodeActivities(() => {
       const next: Record<string, string> = {}
@@ -612,35 +617,46 @@ export default function HomePage() {
   }, [runId, syncRun])
 
   const readiness = useMemo<Readiness>(() => {
+    if (projectLoading) return { ready: false, step: '第 1 步', title: '正在读取项目', detail: '正在恢复本机项目状态，请稍候。', action: '请稍候', target: null }
     if (!project) return { ready: false, step: '第 1 步', title: '选择 Git 项目', detail: '从本机选择项目，Artifact 会检测仓库和常用命令。', action: '选择项目', target: 'project' }
     const agentExecutorIds = [...new Set(nodes.filter(node => node.kind === 'Agent').map(node => node.executorId ?? 'codex'))]
     if (agentExecutorIds.length && !executorsLoaded) return { ready: false, step: '第 3 步', title: '检查 Agent 执行器', detail: '正在读取本地运行时配置。', action: '请稍候', target: null }
     const unavailable = agentExecutorIds.map(id => executorOptions.find(executor => executor.id === id)).find(executor => !executor || !executor.connected || (executor.authentication !== 'authenticated' && executor.authentication !== 'api_key'))
     if (unavailable) return { ready: false, step: '第 3 步', title: `检查 ${unavailable.name ?? 'Agent'} 运行时`, detail: '节点需要本机已安装且已登录的 CLI 运行时。', action: '查看运行时', target: 'executors' }
     return { ready: true, step: '已就绪', title: `${project.name} 可以运行`, detail: '运行将在独立 Worktree 中完成；验证命令会在首次使用前请求授权。', action: '运行工作流', target: null }
-  }, [executorsLoaded, executorOptions, nodes, project])
+  }, [executorsLoaded, executorOptions, nodes, project, projectLoading])
 
+  const navigateToView = (view: string) => {
+    setActiveView(view)
+    try { window.localStorage.setItem(activeViewStorageKey, view) } catch { /* Storage may be unavailable. */ }
+  }
   const openSetup = (target: Readiness['target'] = readiness.target) => {
     if (!target) return
-    setActiveView('settings')
+    navigateToView('settings')
     setSettingsPage(target === 'executors' ? 'executors' : 'overview')
     if (compactLayout) closeCompactPanel()
   }
   const selectView = (view: string) => {
-    setActiveView(view)
+    navigateToView(view)
     if (compactLayout) closeCompactPanel()
     else setSidebarCollapsed(false)
     if (view !== 'settings') setSettingsPage('overview')
     if (view === 'workflow') setWorkflowMode('library')
   }
+  useEffect(() => {
+    try {
+      const savedView = window.localStorage.getItem(activeViewStorageKey)
+      if (savedView && navItems.some(item => item.id === savedView)) setActiveView(savedView)
+    } catch { /* Storage may be unavailable. */ }
+  }, [])
   const openWorkflowLibrary = () => {
-    setActiveView('workflow')
+    navigateToView('workflow')
     setWorkflowMode('library')
     if (compactLayout) closeCompactPanel()
   }
   const openWorkflowEditor = (workflow: WorkflowRecordView) => {
     applyWorkflowRecord(workflow)
-    setActiveView('workflow')
+    navigateToView('workflow')
     setWorkflowMode('editor')
   }
   const createWorkflow = async (template: WorkflowTemplateView) => {
@@ -654,7 +670,7 @@ export default function HomePage() {
       })
       setWorkflows(current => [...current, value])
       applyWorkflowRecord(value)
-      setActiveView('workflow')
+      navigateToView('workflow')
       setWorkflowMode('editor')
       setDraftSaveState('saved')
     } catch (error) {
@@ -768,7 +784,7 @@ export default function HomePage() {
     {activeCompactPanel && <button className="compact-panel-backdrop" type="button" aria-label="关闭侧栏或节点检查器" onClick={closeCompactPanel} />}
     <aside ref={sidebarRef} className="sidebar" aria-label={`${activeNavItem?.label ?? '工作区'}侧栏`} aria-hidden={compactLayout && activeCompactPanel !== 'sidebar'} role={activeCompactPanel === 'sidebar' ? 'dialog' : undefined} aria-modal={activeCompactPanel === 'sidebar' ? true : undefined} onKeyDown={trapCompactPanelFocus}>
       <div className="side-brand"><span className="brand-name">artifact</span><span className="beta">ALPHA</span><button className="sidebar-toggle" onClick={closeSidebar} aria-label="收起侧栏" title="收起侧栏 (⌘B)"><PanelLeftClose aria-hidden="true" /></button></div>
-      <button className="project-switcher" onClick={() => openSetup(project ? 'environment' : 'project')} aria-label={project ? `切换或查看项目 ${project.name}` : '选择项目'}><span className="project-avatar">{project ? project.name.slice(0, 1).toUpperCase() : <Plus aria-hidden="true" />}</span><span><b>{projectName}</b><small>{project ? '命令按需授权' : '选择本地 Git 项目'}</small></span><ChevronRight className="chevron" aria-hidden="true" /></button>
+      <button className="project-switcher" onClick={() => openSetup(project ? 'environment' : 'project')} aria-label={project ? `切换或查看项目 ${project.name}` : '选择项目'}><span className="project-avatar">{project ? project.name.slice(0, 1).toUpperCase() : projectLoading ? <LoaderCircle aria-hidden="true" /> : <Plus aria-hidden="true" />}</span><span><b>{projectName}</b><small>{project ? '命令按需授权' : projectLoading ? '正在恢复本地状态' : '选择本地 Git 项目'}</small></span><ChevronRight className="chevron" aria-hidden="true" /></button>
       <div className="side-label">{activeNavItem?.label ?? '工作区'}</div>
       <div className="sidebar-context">
         {activeView === 'workflow' && workflowMode === 'library' && <><div className="context-summary"><span className="context-icon"><Workflow aria-hidden="true" /></span><div><b>工作流库</b><small>{workflows.length} 个草稿 · {workflows.filter(workflow => workflow.published.length).length} 个已发布</small></div></div><button className="context-action" onClick={() => selectView('runs')}>运行已发布版本 <ChevronRight aria-hidden="true" /></button></>}
@@ -793,7 +809,7 @@ export default function HomePage() {
           <div className="inspector-body">
             <div className="inspector-section-label">基本信息</div>
             <label>节点名称<input value={selected.title} onChange={event => updateSelected({ title: event.target.value })} /></label>
-            {selected.kind === 'Agent' ? <label>执行器<select value={selected.executorId ?? 'codex'} onChange={event => updateSelected({ executorId: event.target.value })}>{configurableExecutors.length ? configurableExecutors.map(executor => <option key={executor.id} value={executor.id}>{executor.name}{executor.connected ? (executor.authentication === 'authenticated' || executor.authentication === 'api_key' ? ' · 可用' : ' · 需要登录') : ' · 未发现'}</option>) : <option value="codex">Codex · 正在加载</option>}</select><small className="field-help">运行时状态由 Artifact 即时读取，模型使用对应 CLI 的默认选择。</small></label> : <label>处理方式<div className="artifact-input">{selected.kind === '审批' ? '人工确认后继续' : selected.kind === '验证' ? '检测到的项目验证命令会按需授权' : '本地 Artifact Core'}</div></label>}
+            {selected.kind === 'Agent' ? <><label>执行器<select value={selected.executorId ?? 'codex'} onChange={event => updateSelected({ executorId: event.target.value })}>{configurableExecutors.length ? configurableExecutors.map(executor => <option key={executor.id} value={executor.id}>{executor.name}{executor.connected ? (executor.authentication === 'authenticated' || executor.authentication === 'api_key' ? ' · 可用' : ' · 需要登录') : ' · 未发现'}</option>) : <option value="codex">Codex · 正在加载</option>}</select><small className="field-help">运行时状态由 Artifact 即时读取，模型使用对应 CLI 的默认选择。</small></label><label>Worktree 权限<select value={selected.executionMode ?? 'read_only'} onChange={event => updateSelected({ executionMode: event.target.value as WorkflowNode['executionMode'] })}><option value="read_only">只读分析</option><option value="workspace_write">允许修改 Worktree</option></select><small className="field-help">这是工作流节点的执行边界，不会修改 Agent 的登录、模型或本地配置。</small></label></> : <label>处理方式<div className="artifact-input">{selected.kind === '审批' ? '人工确认后继续' : selected.kind === '验证' ? '检测到的项目验证命令会按需授权' : '本地 Artifact Core'}</div></label>}
             <div className="inspector-section-label">数据流</div>
             <label>上游节点<select value={primaryInputId} onChange={event => setPrimaryInput(selected.id, event.target.value)}><option value="">无上游输入</option>{nodes.filter(node => node.id !== selected.id).map(node => <option key={node.id} value={node.id}>{node.title} · {node.output}</option>)}</select><small className="field-help">Artifact 会在 Run 开始时冻结当前上游版本。</small></label>
             <label>输出 Schema<select value={selected.output} onChange={event => updateSelected({ output: event.target.value })}>{[...new Set([...outputSchemas, selected.output])].map(schema => <option key={schema} value={schema}>{schema} · v1</option>)}</select></label>
@@ -1136,7 +1152,12 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
 }
 
 function ArtifactView() {
-  type RegistryArtifact = Artifact & { runId: string }
+  type RegistryArtifact = Artifact & {
+    runId: string
+    runStartedAt: string
+    workflow?: Run['workflow']
+    node?: Pick<Run['nodes'][number], 'id' | 'kind' | 'outputType' | 'state'>
+  }
   const [artifacts, setArtifacts] = useState<RegistryArtifact[]>([])
   const [status, setStatus] = useState('all')
   const [detail, setDetail] = useState<{ artifact: RegistryArtifact; payload: unknown } | null>(null)
@@ -1147,7 +1168,13 @@ function ArtifactView() {
   const load = useCallback(() => {
     void fetch('/api/runs')
       .then(response => response.ok ? response.json() : [])
-      .then((runs: Run[]) => setArtifacts(runs.flatMap(run => (run.artifacts ?? []).map(artifact => ({ ...artifact, runId: run.id })))))
+      .then((runs: Run[]) => setArtifacts(runs.flatMap(run => (run.artifacts ?? []).map(artifact => ({
+        ...artifact,
+        runId: run.id,
+        runStartedAt: run.startedAt,
+        workflow: run.workflow,
+        node: run.nodes.find(node => node.id === artifact.nodeId),
+      })))))
   }, [])
 
   useEffect(() => { load(); const timer = window.setInterval(load, 2_000); return () => window.clearInterval(timer) }, [load])
@@ -1156,6 +1183,12 @@ function ArtifactView() {
   const artifactKey = (artifact: RegistryArtifact) => `${artifact.runId}:${artifact.id}`
   const artifactUri = (artifact: RegistryArtifact) => `artifact://${artifact.runId}/${artifact.id}`
   const statusTone = (artifact: RegistryArtifact) => artifact.status === 'valid' ? 'valid' : artifact.status === 'invalid' || artifact.status === 'rejected' ? 'failed' : 'pending'
+  const shortRunId = (runId: string) => runId.length > 12 ? `${runId.slice(0, 12)}` : runId
+  const workflowName = (artifact: RegistryArtifact) => artifact.workflow?.workflowName ?? '历史运行'
+  const workflowVersion = (artifact: RegistryArtifact) => artifact.workflow ? `v${artifact.workflow.revision}` : '未关联流程'
+  const nodeSummary = (artifact: RegistryArtifact) => artifact.node?.kind ? `${artifact.node.id} · ${artifact.node.kind}` : artifact.nodeId
+  const nodeType = (artifact: RegistryArtifact) => artifact.node?.kind ?? '历史节点'
+  const formatTime = (value: string) => new Date(value).toLocaleString('zh-CN')
   const readPayload = async (artifact: RegistryArtifact) => {
     if (detail && artifactKey(detail.artifact) === artifactKey(artifact)) return detail.payload
     const response = await fetch(`/api/runs/${artifact.runId}/artifacts/${artifact.id}`)
@@ -1200,20 +1233,47 @@ function ArtifactView() {
   }
 
   const filtered = status === 'all' ? artifacts : artifacts.filter(artifact => artifact.status === status)
+  const grouped = useMemo(() => {
+    const runGroups = new Map<string, { runId: string; workflow?: RegistryArtifact['workflow']; runStartedAt: string; artifacts: RegistryArtifact[]; nodeGroups: Map<string, RegistryArtifact[]> }>()
+    filtered.forEach(artifact => {
+      let runGroup = runGroups.get(artifact.runId)
+      if (!runGroup) {
+        runGroup = { runId: artifact.runId, workflow: artifact.workflow, runStartedAt: artifact.runStartedAt, artifacts: [], nodeGroups: new Map() }
+        runGroups.set(artifact.runId, runGroup)
+      }
+      runGroup.artifacts.push(artifact)
+      const type = nodeType(artifact)
+      const nodeArtifacts = runGroup.nodeGroups.get(type) ?? []
+      nodeArtifacts.push(artifact)
+      runGroup.nodeGroups.set(type, nodeArtifacts)
+    })
+    return Array.from(runGroups.values())
+      .sort((a, b) => b.runStartedAt.localeCompare(a.runStartedAt))
+      .map(runGroup => ({
+        ...runGroup,
+        nodeGroups: Array.from(runGroup.nodeGroups.entries())
+          .map(([type, nodeArtifacts]) => ({ type, artifacts: nodeArtifacts.sort((a, b) => (b.version ?? 1) - (a.version ?? 1) || b.createdAt.localeCompare(a.createdAt)) }))
+          .sort((a, b) => a.type.localeCompare(b.type)),
+      }))
+  }, [filtered])
+  const renderArtifactCard = (artifact: RegistryArtifact) => {
+    const key = artifactKey(artifact)
+    const uri = artifactUri(artifact)
+    return <article className={`artifact-card ${statusTone(artifact)}`} key={key}>
+      <header><span className="artifact-card-icon"><Package aria-hidden="true" /></span><div><span className="section-kicker">节点 · {artifact.node?.id ?? artifact.nodeId}</span><h2 title={artifact.type}>{artifact.type} <small>v{artifact.version ?? 1}</small></h2></div><em className={`status-pill ${statusTone(artifact)}`}>{artifact.status}</em></header>
+      <dl className="artifact-card-meta"><div><dt>输出类型</dt><dd title={artifact.node?.outputType ?? artifact.type}>{artifact.node?.outputType ?? artifact.type}</dd></div><div><dt>Schema</dt><dd title={`${artifact.schemaId ?? 'artifact'} v${artifact.schemaVersion ?? 1}`}>{artifact.schemaId ?? 'artifact'} v{artifact.schemaVersion ?? 1}</dd></div><div><dt>SHA-256</dt><dd><code title={artifact.contentHash}>{artifact.contentHash.slice(0, 16)}</code></dd></div><div className="artifact-created-at"><dt>创建时间</dt><dd>{formatTime(artifact.createdAt)}</dd></div></dl>
+      <footer><code className="artifact-uri" title={uri}>{uri}</code><div className="artifact-card-actions"><button className="header-icon-button" type="button" title="预览 Artifact" aria-label="预览 Artifact" onClick={() => void open(artifact)}><Eye aria-hidden="true" /></button><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(artifact)}>{copiedKey === key ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(artifact)}><Download aria-hidden="true" /></button></div></footer>
+    </article>
+  }
   return <section className="content-view artifact-registry">
     <div className="view-heading artifact-registry-heading"><div><span className="section-kicker">ARTIFACT REGISTRY</span><h1>Artifacts</h1><p>Schema 校验、SHA-256 内容哈希和上游血缘均随 Run 持久化。</p></div><label className="table-filter">状态<select value={status} onChange={event => setStatus(event.target.value)}><option value="all">全部状态</option><option value="valid">已验证</option><option value="awaiting_approval">待审批</option><option value="invalid">无效</option><option value="rejected">已拒绝</option></select></label></div>
     <div className="stats-row artifact-stats"><div><span>总产物</span><strong>{artifacts.length}</strong></div><div><span>已验证</span><strong className="green-text">{artifacts.filter(item => item.status === 'valid').length}</strong></div><div><span>无效</span><strong>{artifacts.filter(item => item.status === 'invalid').length}</strong></div><div><span>待审批</span><strong className="amber-text">{artifacts.filter(item => item.status === 'awaiting_approval').length}</strong></div></div>
     {actionError && <div className="artifact-action-notice" role="alert">{actionError}</div>}
-    {filtered.length ? <div className="artifact-grid">{filtered.map(artifact => {
-      const key = artifactKey(artifact)
-      const uri = artifactUri(artifact)
-      return <article className={`artifact-card ${statusTone(artifact)}`} key={key}>
-        <header><span className="artifact-card-icon"><Package aria-hidden="true" /></span><div><span className="section-kicker">{artifact.nodeId}</span><h2 title={artifact.type}>{artifact.type} <small>v{artifact.version ?? 1}</small></h2></div><em className={`status-pill ${statusTone(artifact)}`}>{artifact.status}</em></header>
-        <dl className="artifact-card-meta"><div><dt>Schema</dt><dd title={`${artifact.schemaId ?? 'artifact'} v${artifact.schemaVersion ?? 1}`}>{artifact.schemaId ?? 'artifact'} v{artifact.schemaVersion ?? 1}</dd></div><div><dt>SHA-256</dt><dd><code title={artifact.contentHash}>{artifact.contentHash.slice(0, 16)}</code></dd></div><div><dt>创建时间</dt><dd>{new Date(artifact.createdAt).toLocaleString('zh-CN')}</dd></div></dl>
-        <footer><code className="artifact-uri" title={uri}>{uri}</code><div className="artifact-card-actions"><button className="header-icon-button" type="button" title="预览 Artifact" aria-label="预览 Artifact" onClick={() => void open(artifact)}><Eye aria-hidden="true" /></button><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(artifact)}>{copiedKey === key ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(artifact)}><Download aria-hidden="true" /></button></div></footer>
-      </article>
-    })}</div> : <div className="empty-state">没有匹配此状态的 Artifact。</div>}
-    {detail && <DetailPanel variant="modal" title={`${detail.artifact.type} v${detail.artifact.version ?? 1}`} onClose={() => setDetail(null)}><div className="artifact-detail-actions"><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(detail.artifact)}>{copiedKey === artifactKey(detail.artifact) ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(detail.artifact)}><Download aria-hidden="true" /></button></div><div className="artifact-detail-meta"><span>Run</span><code title={detail.artifact.runId}>{detail.artifact.runId}</code><span>Artifact URI</span><code title={artifactUri(detail.artifact)}>{artifactUri(detail.artifact)}</code><span>上游输入</span><div className="lineage-list">{detail.artifact.inputArtifactIds?.length ? detail.artifact.inputArtifactIds.map(id => <button key={id} onClick={() => { const upstream = artifacts.find(artifact => artifact.id === id); if (upstream) void open(upstream) }}>{id}</button>) : <em>无上游 Artifact</em>}</div></div><pre>{JSON.stringify(detail.payload, null, 2)}</pre></DetailPanel>}
+    {grouped.length ? <div className="artifact-groups">{grouped.map(runGroup => <details className="artifact-run-group" key={runGroup.runId} open>
+      <summary className="artifact-run-group-header"><ChevronRight className="artifact-collapse-icon" aria-hidden="true" /><div className="artifact-run-group-title"><span className="artifact-group-icon"><Workflow aria-hidden="true" /></span><div><span className="section-kicker">流程实例</span><h2 title={runGroup.workflow?.workflowName ?? '历史运行'}>{runGroup.workflow?.workflowName ?? '历史运行'} <small>{runGroup.workflow ? `· v${runGroup.workflow.revision}` : '· 未关联流程'}</small></h2><p><code title={runGroup.runId}>{shortRunId(runGroup.runId)}</code><span>开始于 {formatTime(runGroup.runStartedAt)}</span></p></div></div><span className="artifact-group-count">{runGroup.artifacts.length} 个产物</span></summary>
+      <div className="artifact-node-groups">{runGroup.nodeGroups.map(nodeGroup => <details className="artifact-node-group" key={nodeGroup.type} open><summary><ChevronRight className="artifact-collapse-icon" aria-hidden="true" /><div><span className="section-kicker">节点类型</span><h3>{nodeGroup.type}</h3></div><span>{nodeGroup.artifacts.length} 个版本</span></summary><div className="artifact-grid">{nodeGroup.artifacts.map(renderArtifactCard)}</div></details>)}</div>
+    </details>)}</div> : <div className="empty-state">没有匹配此状态的 Artifact。</div>}
+    {detail && <DetailPanel variant="modal" title={`${detail.artifact.type} v${detail.artifact.version ?? 1}`} onClose={() => setDetail(null)}><div className="artifact-detail-actions"><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(detail.artifact)}>{copiedKey === artifactKey(detail.artifact) ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(detail.artifact)}><Download aria-hidden="true" /></button></div><div className="artifact-detail-meta"><span>所属流程</span><strong title={workflowName(detail.artifact)}>{workflowName(detail.artifact)} · {workflowVersion(detail.artifact)}</strong><span>所属节点</span><strong title={nodeSummary(detail.artifact)}>{nodeSummary(detail.artifact)}</strong><span>Run</span><code title={detail.artifact.runId}>{detail.artifact.runId}</code><span>Artifact URI</span><code title={artifactUri(detail.artifact)}>{artifactUri(detail.artifact)}</code><span>上游输入</span><div className="lineage-list">{detail.artifact.inputArtifactIds?.length ? detail.artifact.inputArtifactIds.map(id => <button key={id} onClick={() => { const upstream = artifacts.find(artifact => artifact.id === id); if (upstream) void open(upstream) }}>{id}</button>) : <em>无上游 Artifact</em>}</div></div><pre>{JSON.stringify(detail.payload, null, 2)}</pre></DetailPanel>}
   </section>
 }
 
@@ -1251,7 +1311,7 @@ function RunsView({ onOpenWorkflow }: { onOpenWorkflow: (run: Run, nodeId?: stri
     load()
   }
   const showWorktree = async (path: string) => { await window.artifactDesktop?.showItem(path) }
-  return <section className="content-view"><div className="view-heading"><div><span className="section-kicker">EXECUTION HISTORY</span><h1>运行记录</h1><p>查看 Worktree、恢复状态、节点 Attempt 和交付结果。</p></div></div><div className="run-list">{runs.length === 0 ? <div className="empty-state">还没有运行记录。</div> : runs.map(run => { const recovered = hasRecoveredAttempt(run); return <button className="run-row run-row-button" key={run.id} onClick={() => setSelected(run)}><span className={`run-state ${run.status === 'succeeded' ? 'success' : run.status === 'failed' ? 'failed' : 'pending'}`}><i /></span><div><b>{run.id}</b><small>{new Date(run.startedAt).toLocaleString('zh-CN')}{recovered ? ' · 已从服务重启恢复' : ''}</small></div><span className="run-progress">{run.nodes.filter(node => node.state === 'success').length} / {run.nodes.length}</span><em className={`status-pill ${run.status === 'failed' ? 'failed' : run.status === 'succeeded' ? 'valid' : 'pending'}`}>{runStatusLabel(run.status)}</em><span>›</span></button> })}</div>{selected && <DetailPanel title={selected.id} onClose={() => setSelected(null)}>{hasRecoveredAttempt(selected) && <div className="recovery-notice"><b>已恢复此运行</b><span>服务重启后，未完成的 Attempt 已标记为 process_lost 并从可运行节点继续。</span></div>}{actionError && <div className="executor-notice error">{actionError}</div>}<div className="run-detail-actions"><button className="ghost-btn" onClick={() => onOpenWorkflow(selected)}>在工作流中查看</button>{['running', 'preparing', 'awaiting_approval'].includes(selected.status) && <button className="reject-btn" onClick={() => void cancel(selected.id)}>取消运行</button>}</div><div className="run-detail-meta"><b>Worktree</b><div className="path-with-action"><code>{selected.worktreePath ?? '准备中'}</code>{selected.worktreePath && window.artifactDesktop && <button className="ghost-btn" title="在 Finder 中显示 Worktree" onClick={() => void showWorktree(selected.worktreePath!)}>在 Finder 中显示</button>}</div><b>Branch</b><code>{selected.branchName ?? '—'}</code><b>状态</b><code>{runStatusLabel(selected.status)}</code></div><div className="attempt-list">{selected.nodes.map(node => <div className="attempt-row" key={node.id}><div><b>{node.id}</b><small>{stateLabel(node.state as NodeState)} · {node.attempts?.length ?? 0} Attempts</small>{node.attempts?.at(-1)?.exitReason && <p>{node.attempts.at(-1)?.exitReason}</p>}</div><div className="attempt-actions"><button className="text-btn" onClick={() => onOpenWorkflow(selected, node.id)}>定位节点</button>{['failed', 'skipped', 'cancelled'].includes(node.state) && <button className="ghost-btn" disabled={retryingNode === node.id} onClick={() => void retry(selected.id, node.id)}>{retryingNode === node.id ? '重试中…' : '从此节点重试'}</button>}</div></div>)}</div><pre>{selected.logs.join('\n')}</pre></DetailPanel>}</section>
+ return <section className="content-view"><div className="view-heading"><div><span className="section-kicker">EXECUTION HISTORY</span><h1>运行记录</h1><p>查看 Worktree、恢复状态、节点 Attempt 和交付结果。</p></div></div><div className="run-list">{runs.length === 0 ? <div className="empty-state">还没有运行记录。</div> : runs.map(run => { const recovered = hasRecoveredAttempt(run); return <button className="run-row run-row-button" key={run.id} onClick={() => setSelected(run)}><span className={`run-state ${run.status === 'succeeded' ? 'success' : run.status === 'failed' ? 'failed' : 'pending'}`}><i /></span><div><b>{run.id}</b><small>{new Date(run.startedAt).toLocaleString('zh-CN')}{recovered ? ' · 已从服务重启恢复' : ''}</small></div><span className="run-progress">{run.nodes.filter(node => node.state === 'success').length} / {run.nodes.length}</span><em className={`status-pill ${run.status === 'failed' ? 'failed' : run.status === 'succeeded' ? 'valid' : 'pending'}`}>{runStatusLabel(run.status)}</em><span>›</span></button> })}</div>{selected && <DetailPanel title={selected.id} onClose={() => setSelected(null)}>{hasRecoveredAttempt(selected) && <div className="recovery-notice"><b>已恢复此运行</b><span>服务重启后，未完成的 Attempt 已标记为 process_lost 并从可运行节点继续。</span></div>}{actionError && <div className="executor-notice error">{actionError}</div>}<div className="run-detail-actions"><button className="ghost-btn" onClick={() => onOpenWorkflow(selected)}>在工作流中查看</button>{['running', 'preparing', 'awaiting_input', 'awaiting_approval', 'awaiting_delivery'].includes(selected.status) && <button className="reject-btn" onClick={() => void cancel(selected.id)}>取消运行</button>}</div><div className="run-detail-meta"><b>Worktree</b><div className="path-with-action"><code>{selected.worktreePath ?? '准备中'}</code>{selected.worktreePath && window.artifactDesktop && <button className="ghost-btn" title="在 Finder 中显示 Worktree" onClick={() => void showWorktree(selected.worktreePath!)}>在 Finder 中显示</button>}</div><b>Branch</b><code>{selected.branchName ?? '—'}</code><b>状态</b><code>{runStatusLabel(selected.status)}</code></div><div className="attempt-list">{selected.nodes.map(node => <div className="attempt-row" key={node.id}><div><b>{node.id}</b><small>{stateLabel(node.state as NodeState)} · {node.attempts?.length ?? 0} Attempts</small>{node.attempts?.at(-1)?.exitReason && <p>{node.attempts.at(-1)?.exitReason}</p>}</div><div className="attempt-actions"><button className="text-btn" onClick={() => onOpenWorkflow(selected, node.id)}>定位节点</button>{(['failed', 'skipped', 'cancelled'].includes(node.state) || (['failed', 'cancelled'].includes(selected.status) && node.state === 'paused')) && <button className="ghost-btn" disabled={retryingNode === node.id} onClick={() => void retry(selected.id, node.id)}>{retryingNode === node.id ? '重试中…' : '从此节点重试'}</button>}</div></div>)}</div><pre>{selected.logs.join('\n')}</pre></DetailPanel>}</section>
 }
 
 function DetailPanel({ title, onClose, children, variant = 'drawer' }: { title: string; onClose: () => void; children: React.ReactNode; variant?: 'drawer' | 'modal' }) {
@@ -1295,4 +1355,4 @@ function canvasActivityText(event: { kind?: string; toolName?: string; content?:
   const activity = latestActivity(event ? { trace: [event] } : undefined)
   return `${activity.icon} ${activity.label}`
 }
-function runStatusLabel(status: string | null): string { return ({ preparing: '准备中', running: '运行中', paused: '已暂停', awaiting_approval: '待审批', succeeded: '已完成', failed: '失败', cancelled: '已取消' })[status ?? ''] ?? (status ?? '尚未开始') }
+function runStatusLabel(status: string | null): string { return ({ preparing: '准备中', running: '运行中', paused: '已暂停', awaiting_input: '等待用户输入', awaiting_approval: '待审批', awaiting_delivery: '待交付审批', succeeded: '已完成', failed: '失败', cancelled: '已取消' })[status ?? ''] ?? (status ?? '尚未开始') }
