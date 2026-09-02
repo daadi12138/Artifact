@@ -66,6 +66,7 @@ export {
   listRuns,
   pauseRun,
   readArtifactPayload,
+  reviseArtifactPayload,
   rejectRun,
   requestRunInteraction,
   requestDeliveryApproval,
@@ -118,3 +119,10 @@ export {
 } from '../storage-management'
 
 export { schemaFor, validatePayload, type JsonSchema } from '../artifact-schema'
+
+export {
+  listProjectFiles,
+  readProjectFile,
+  writeProjectFile,
+  type ProjectFileEntry,
+} from '../project-files'

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode, type Ref } from 'react'
 import { AlertTriangle, ArrowDown, ArrowLeft, Check, CirclePause, CirclePlay, Clock3, Copy, FileCode2, FileText, FolderOpen, GitBranch, ImagePlus, LoaderCircle, MessageCircleQuestion, Package, PanelBottom, Paperclip, Play, RotateCcw, Search, Send, ShieldAlert, Square, Terminal, Waypoints, X } from 'lucide-react'
+import { readPreference, removePreference, writePreference } from './preferences'
 import { defaultRunMetricColumnWeights, minimumRunMetricColumnWidths, normalizeRunMetricColumnWeights, parseRunMetricColumnWeights, resizeRunMetricColumnPair, serializeRunMetricColumnWeights, type RunMetricColumnValues } from './run-metric-layout'
 import type { WorkflowRecordView } from './workflow-library'
 
@@ -222,7 +223,7 @@ function RunMetricsStrip({ status, completedNodeCount, nodeCount, progress, star
     setColumnWeights(next)
     if (persist) {
       try {
-        window.localStorage.setItem(runMetricColumnStorageKey, serializeRunMetricColumnWeights(next))
+        writePreference(runMetricColumnStorageKey, serializeRunMetricColumnWeights(next))
       } catch {
         // Storage can be unavailable in privacy-restricted browser contexts.
       }
@@ -298,7 +299,7 @@ function RunMetricsStrip({ status, completedNodeCount, nodeCount, progress, star
   useEffect(() => {
     let restored = [...defaultRunMetricColumnWeights] as RunMetricColumnValues
     try {
-      restored = parseRunMetricColumnWeights(window.localStorage.getItem(runMetricColumnStorageKey))
+      restored = parseRunMetricColumnWeights(readPreference(runMetricColumnStorageKey))
     } catch {
       // Keep the default layout when storage is unavailable.
     }
@@ -370,7 +371,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   const [runs, setRuns] = useState<RunWorkspaceRun[]>([])
   const [selectedRunId, setSelectedRunId] = useState<string | null | undefined>(() => {
     if (typeof window === 'undefined') return undefined
-    try { return window.localStorage.getItem(selectedRunStorageKey) ?? undefined } catch { return undefined }
+    return readPreference(selectedRunStorageKey) ?? undefined
   })
   const [workflowId, setWorkflowId] = useState('')
   const [text, setText] = useState('')
@@ -458,13 +459,13 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
     const next = previewRunPanelSize(kind, value)
     if (kind === 'history-width') {
       setRunHistoryWidth(next)
-      window.localStorage.setItem('artifact.run-workspace.history-width', String(next))
+      writePreference('artifact.run-workspace.history-width', String(next))
     } else if (kind === 'context-width') {
       setRunContextWidth(next)
-      window.localStorage.setItem('artifact.run-workspace.context-width', String(next))
+      writePreference('artifact.run-workspace.context-width', String(next))
     } else {
       setRunHistoryHeight(next)
-      window.localStorage.setItem('artifact.run-workspace.history-height', String(next))
+      writePreference('artifact.run-workspace.history-height', String(next))
     }
   }
   const startRunPanelResize = (kind: RunPanelResizeKind, event: ReactPointerEvent<HTMLButtonElement>) => {
@@ -517,7 +518,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
 
   useEffect(() => {
     const readSize = (key: string, fallback: number, min: number, max: number) => {
-      const value = Number.parseInt(window.localStorage.getItem(key) ?? '', 10)
+      const value = Number.parseInt(readPreference(key) ?? '', 10)
       return Number.isFinite(value) ? constrainPanelSize(value, min, max) : fallback
     }
     const historyWidth = readSize('artifact.run-workspace.history-width', defaultRunHistoryWidth, minRunHistoryWidth, maxRunHistoryWidth)
@@ -529,8 +530,8 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
     setRunHistoryWidth(historyWidth)
     setRunContextWidth(contextWidth)
     setRunHistoryHeight(historyHeight)
-    const storedLogVisible = window.localStorage.getItem('artifact.run-workspace.log-panel-visible')
-    const storedLogHeight = Number.parseInt(window.localStorage.getItem('artifact.run-workspace.log-panel-height') ?? '', 10)
+    const storedLogVisible = readPreference('artifact.run-workspace.log-panel-visible')
+    const storedLogHeight = Number.parseInt(readPreference('artifact.run-workspace.log-panel-height') ?? '', 10)
     const nextLogHeight = Number.isFinite(storedLogHeight) ? Math.max(minRunLogHeight, Math.min(maxRunLogHeight, storedLogHeight)) : defaultRunLogHeight
     logPanelHeightRef.current = nextLogHeight
     setLogPanelHeight(nextLogHeight)
@@ -577,8 +578,8 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
 
   useEffect(() => {
     try {
-      if (selectedRunId) window.localStorage.setItem(selectedRunStorageKey, selectedRunId)
-      else if (selectedRunId === null) window.localStorage.removeItem(selectedRunStorageKey)
+      if (selectedRunId) writePreference(selectedRunStorageKey, selectedRunId)
+      else if (selectedRunId === null) removePreference(selectedRunStorageKey)
     } catch { /* Storage may be unavailable. */ }
   }, [selectedRunId])
 
@@ -790,7 +791,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   const toggleLogPanel = () => {
     setLogPanelVisible(current => {
       const next = !current
-      try { window.localStorage.setItem('artifact.run-workspace.log-panel-visible', String(next)) } catch { /* Storage may be unavailable. */ }
+      writePreference('artifact.run-workspace.log-panel-visible', String(next))
       return next
     })
   }
@@ -815,7 +816,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
     logPanelResizeRef.current = null
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId)
     setLogPanelResizing(false)
-    try { window.localStorage.setItem('artifact.run-workspace.log-panel-height', String(logPanelHeightRef.current)) } catch { /* Storage may be unavailable. */ }
+    writePreference('artifact.run-workspace.log-panel-height', String(logPanelHeightRef.current))
   }
   const adjustLogPanelHeight = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
     const step = event.shiftKey ? 32 : 16
@@ -829,7 +830,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
     const value = Math.max(minRunLogHeight, Math.min(maxRunLogHeight, next))
     logPanelHeightRef.current = value
     setLogPanelHeight(value)
-    try { window.localStorage.setItem('artifact.run-workspace.log-panel-height', String(value)) } catch { /* Storage may be unavailable. */ }
+    writePreference('artifact.run-workspace.log-panel-height', String(value))
   }
 
   // Follow the newest trace line while the attempt runs; a manual scroll up pauses it.
@@ -995,7 +996,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
         </aside>
       </div>
       {logPanelVisible && <section className={`run-bottom-log-panel ${logPanelResizing ? 'resizing' : ''}`} style={{ '--run-log-height': `${logPanelHeight}px` } as CSSProperties} aria-label="运行日志终端">
-        <button className="run-log-splitter" type="button" role="separator" aria-label="调整运行日志终端高度" aria-orientation="horizontal" aria-controls="run-log-content" aria-valuemin={minRunLogHeight} aria-valuemax={maxRunLogHeight} aria-valuenow={logPanelHeight} title="拖动调整日志终端高度；双击恢复默认" onPointerDown={startLogPanelResize} onPointerMove={resizeLogPanel} onPointerUp={finishLogPanelResize} onPointerCancel={finishLogPanelResize} onLostPointerCapture={finishLogPanelResize} onKeyDown={adjustLogPanelHeight} onDoubleClick={() => { logPanelHeightRef.current = defaultRunLogHeight; setLogPanelHeight(defaultRunLogHeight); try { window.localStorage.setItem('artifact.run-workspace.log-panel-height', String(defaultRunLogHeight)) } catch { /* Storage may be unavailable. */ } }} />
+        <button className="run-log-splitter" type="button" role="separator" aria-label="调整运行日志终端高度" aria-orientation="horizontal" aria-controls="run-log-content" aria-valuemin={minRunLogHeight} aria-valuemax={maxRunLogHeight} aria-valuenow={logPanelHeight} title="拖动调整日志终端高度；双击恢复默认" onPointerDown={startLogPanelResize} onPointerMove={resizeLogPanel} onPointerUp={finishLogPanelResize} onPointerCancel={finishLogPanelResize} onLostPointerCapture={finishLogPanelResize} onKeyDown={adjustLogPanelHeight} onDoubleClick={() => { logPanelHeightRef.current = defaultRunLogHeight; setLogPanelHeight(defaultRunLogHeight); writePreference('artifact.run-workspace.log-panel-height', String(defaultRunLogHeight)) }} />
         <div className="run-bottom-log-heading"><div className="run-bottom-log-title"><Terminal aria-hidden="true" /><span>运行日志</span><span className="run-log-count">{logQuery ? `${filteredLogs.length}/${selectedRun.logs.length}` : `${selectedRun.logs.length}`} 行</span></div><div className="run-log-actions"><label className="run-log-filter"><Search aria-hidden="true" /><input type="search" value={logQuery} onChange={event => setLogQuery(event.target.value)} placeholder="过滤日志" aria-label="过滤运行日志" />{logQuery && <button type="button" title="清除日志过滤" aria-label="清除日志过滤" onClick={() => setLogQuery('')}><X aria-hidden="true" /></button>}</label><button className="run-copy-button" title="复制当前日志" aria-label="复制当前日志" onClick={() => void copyText(filteredLogs.join('\n'), 'log')}>{copiedKey === 'log' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="run-log-close" type="button" title="关闭运行日志终端" aria-label="关闭运行日志终端" onClick={toggleLogPanel}><X aria-hidden="true" /></button></div></div>
         <div id="run-log-content" ref={logContentRef} className="run-bottom-log-content"><div className="run-log-summary">{filteredLogs.length > visibleLogs.length && <span>显示最近 {visibleLogs.length} 行</span>}</div><pre>{logText || (selectedRun.logs.length ? '没有匹配的日志行。' : '暂无日志。')}</pre></div>
       </section>}

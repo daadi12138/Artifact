@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
-import { AlertTriangle, ArrowLeft, ArrowUp, Check, Copy, Download, ExternalLink, HardDrive, Moon, RefreshCw, ScanSearch, Sun, Trash2 } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, ArrowUp, Check, Copy, Download, ExternalLink, HardDrive, Monitor, Moon, RefreshCw, ScanSearch, Sun, Trash2 } from 'lucide-react'
 
 type ExecutorEnvironmentState = 'ready' | 'discovered' | 'update_available' | 'not_installed' | 'error'
 type ExecutorAuthenticationState = 'authenticated' | 'api_key' | 'needs_login' | 'unknown'
@@ -27,7 +27,7 @@ const futureExecutors = [
 
 type SetupStep = 1 | 2 | 3
 type ProjectMode = 'idle' | 'create' | 'manual-import'
-type InterfaceTheme = 'dark' | 'light'
+type InterfaceTheme = 'system' | 'dark' | 'light'
 type FeedbackNotice = { kind: 'success' | 'error'; text: string }
 type FeedbackNoticeState = FeedbackNotice & { id: number }
 type SettingsOverviewProps = {
@@ -213,7 +213,7 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
     else setProjectMode('manual-import')
   }
   const handleThemeKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
-    const themes: InterfaceTheme[] = ['dark', 'light']
+    const themes: InterfaceTheme[] = ['system', 'dark', 'light']
     const currentIndex = themes.indexOf(theme)
     const nextIndex = event.key === 'ArrowLeft' || event.key === 'ArrowUp'
       ? (currentIndex + themes.length - 1) % themes.length
@@ -322,6 +322,19 @@ export function SettingsOverview({ onExecutors, onOpenWorkflow, executorConfigur
           <p>选择适合当前环境的主题。</p>
         </div>
         <div className="appearance-theme-options" role="radiogroup" aria-labelledby="appearance-theme-title">
+          <button
+            type="button"
+            className={`appearance-theme-option ${theme === 'system' ? 'active' : ''}`}
+            role="radio"
+            aria-checked={theme === 'system'}
+            tabIndex={theme === 'system' ? 0 : -1}
+            data-theme-option="system"
+            onClick={() => onThemeChange('system')}
+            onKeyDown={handleThemeKeyDown}
+          >
+            <Monitor size={16} aria-hidden="true" />
+            <span><b>跟随系统</b><small>自动切换</small></span>
+          </button>
           <button
             type="button"
             className={`appearance-theme-option ${theme === 'dark' ? 'active' : ''}`}

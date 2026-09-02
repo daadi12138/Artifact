@@ -444,6 +444,42 @@ export async function readArtifactPayload(runId: string, artifactId: string): Pr
   try { return JSON.parse(await readFile(join(runDirectory(run.id), artifact.path), 'utf8')) as unknown } catch { return null }
 }
 
+export async function reviseArtifactPayload(runId: string, artifactId: string, payload: unknown): Promise<RunArtifact | null> {
+  const run = await getRun(runId)
+  const source = run?.artifacts.find(item => item.id === artifactId)
+  if (!run || !source) return null
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Artifact payload must be an object')
+  const value = payload as Record<string, unknown>
+  const schema = schemaFor(source.type)
+  const validationErrors = validatePayload(schema, value)
+  if (validationErrors.length) throw new Error(`Artifact schema validation failed: ${validationErrors.join(', ')}`)
+  const serialized = JSON.stringify(value, null, 2)
+  if (serialized.length > 1_000_000) throw new Error('Artifact payload exceeds the 1 MB editing limit')
+  const version = Math.max(0, ...run.artifacts.filter(item => item.type === source.type).map(item => item.version)) + 1
+  const revised: RunArtifact = {
+    id: `${source.nodeId}-${randomUUID()}`,
+    nodeId: source.nodeId,
+    type: source.type,
+    version,
+    schemaId: schema.$id,
+    schemaVersion: schema.version,
+    status: 'valid',
+    path: join('artifacts', source.nodeId, `v${version}`, 'payload.json'),
+    contentHash: hash(serialized),
+    inputArtifactIds: [source.id],
+    validationErrors: [],
+    createdAt: new Date().toISOString(),
+  }
+  const payloadPath = join(runDirectory(run.id), revised.path)
+  await atomicWrite(payloadPath, serialized)
+  await atomicWrite(join(dirname(payloadPath), 'payload.md'), typeof value.content === 'string' ? value.content : serialized)
+  await atomicWrite(join(dirname(payloadPath), 'manifest.json'), JSON.stringify(revised, null, 2))
+  run.artifacts.push(revised)
+  appendEvent(run, 'artifact', `${source.nodeId} · 已从 ${source.type} v${source.version} 创建编辑版本 v${version}`, source.nodeId, undefined, { artifactId: revised.id, sourceArtifactId: source.id, type: source.type, version })
+  await saveRun(run)
+  return revised
+}
+
 async function ensureRecovery(): Promise<void> {
   if (recoveryStarted) return; recoveryStarted = true
   await resumeInterruptedRuns()

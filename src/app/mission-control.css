@@ -1887,23 +1887,25 @@ button > svg {
 
 .approval-banner {
   position: fixed;
-  right: clamp(16px, 3vw, 34px);
-  bottom: 18px;
+  bottom: 37px;
+  left: 50%;
   z-index: 30;
   width: min(720px, calc(100vw - 32px));
   max-height: min(56vh, 620px);
   overflow: auto;
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr) auto;
+  grid-template-columns: 32px minmax(0, 1fr);
   flex: 0 0 auto;
-  align-items: center;
+  align-items: start;
   gap: 12px;
   margin: 0;
-  padding: 11px 13px;
-  border: 1px solid rgb(245 158 11 / 46%);
+  padding: 13px 14px;
+  border: 1px solid #355277;
   border-radius: 7px;
-  background: rgb(245 158 11 / 11%);
-  color: #fef3c7;
+  background: #111b2d;
+  color: #e5edf8;
+  box-shadow: 0 8px 22px rgb(0 0 0 / 18%);
+  transform: translateX(-50%);
 }
 
 .approval-banner-icon {
@@ -1911,10 +1913,10 @@ button > svg {
   width: 32px;
   height: 32px;
   place-items: center;
-  border: 1px solid rgb(245 158 11 / 35%);
+  border: 1px solid #66522d;
   border-radius: 6px;
-  background: rgb(245 158 11 / 14%);
-  color: var(--warning-bright);
+  background: #2b2415;
+  color: #e2b95c;
 }
 
 .approval-banner-icon svg {
@@ -1934,13 +1936,13 @@ button > svg {
 }
 
 .approval-banner-copy b {
-  color: #fef3c7;
+  color: #e5edf8;
   font-size: 11px;
 }
 
 .approval-banner-copy code {
   overflow: hidden;
-  color: #fde68a;
+  color: #9fb4d1;
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1948,7 +1950,7 @@ button > svg {
 
 .approval-banner-copy small {
   overflow: hidden;
-  color: #d6bd79;
+  color: #8190a7;
   font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1969,9 +1971,9 @@ button > svg {
   align-items: start;
   gap: 6px;
   padding: 4px 5px;
-  border: 1px solid rgb(245 158 11 / 20%);
+  border: 1px solid #2b405f;
   border-radius: 4px;
-  background: rgb(15 23 42 / 42%);
+  background: #0b1220;
 }
 
 .delivery-change.conflict {
@@ -1980,14 +1982,14 @@ button > svg {
 }
 
 .delivery-change > span {
-  color: #fde68a;
+  color: #e2b95c;
   font-size: 9px;
   line-height: 1.45;
 }
 
 .delivery-change > code {
   overflow: visible;
-  color: #fef3c7;
+  color: #cbd5e1;
   font-size: 9px;
   line-height: 1.45;
   text-overflow: clip;
@@ -1996,7 +1998,7 @@ button > svg {
 }
 
 .delivery-change > em {
-  color: #d6bd79;
+  color: #8190a7;
   font-size: 8px;
   font-style: normal;
   line-height: 1.45;
@@ -2015,6 +2017,9 @@ button > svg {
 
 .approval-banner-actions {
   display: flex;
+  grid-column: 2;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 7px;
 }
 
@@ -5127,14 +5132,11 @@ button > svg {
 
 /* Library, canvas, menus and inspector */
 :root[data-theme='light'] .app-shell .command-approval,
-:root[data-theme='light'] .app-shell .approval-banner,
-:root[data-theme='light'] .app-shell .approval-banner-copy b,
 :root[data-theme='light'] .app-shell .run-approval-card > b {
   color: var(--warning-bright);
 }
 
 :root[data-theme='light'] .app-shell .command-approval code,
-:root[data-theme='light'] .app-shell .approval-banner-copy code,
 :root[data-theme='light'] .app-shell .run-approval-card > code {
   border-color: rgb(217 119 6 / 24%);
   background: rgb(217 119 6 / 8%);
@@ -5142,9 +5144,59 @@ button > svg {
 }
 
 :root[data-theme='light'] .app-shell .command-approval small,
-:root[data-theme='light'] .app-shell .approval-banner-copy small,
 :root[data-theme='light'] .app-shell .run-approval-card > p {
   color: #a16207;
+}
+
+:root[data-theme='light'] .app-shell .approval-banner {
+  border-color: #d8e0ea;
+  background: #ffffff;
+  color: #27364a;
+  box-shadow: 0 8px 22px rgb(15 23 42 / 10%);
+}
+
+:root[data-theme='light'] .app-shell .approval-banner-icon {
+  border-color: #e8d8b1;
+  background: #fff8e7;
+  color: #9a6b0b;
+}
+
+:root[data-theme='light'] .app-shell .approval-banner-copy b {
+  color: #27364a;
+}
+
+:root[data-theme='light'] .app-shell .approval-banner-copy code {
+  color: #536b91;
+}
+
+:root[data-theme='light'] .app-shell .approval-banner-copy small {
+  color: #718096;
+}
+
+:root[data-theme='light'] .app-shell .delivery-change {
+  border-color: #d8e0ea;
+  background: #f8fafc;
+}
+
+:root[data-theme='light'] .app-shell .delivery-change.conflict {
+  border-color: #efb8be;
+  background: #fff5f6;
+}
+
+:root[data-theme='light'] .app-shell .delivery-change > span {
+  color: #9a6b0b;
+}
+
+:root[data-theme='light'] .app-shell .delivery-change > code {
+  color: #334155;
+}
+
+:root[data-theme='light'] .app-shell .delivery-change > em {
+  color: #718096;
+}
+
+:root[data-theme='light'] .app-shell .delivery-change > small {
+  color: #be123c;
 }
 
 :root[data-theme='light'] .app-shell .canvas-area {
@@ -5521,8 +5573,8 @@ button > svg {
 
 .appearance-theme-options {
   display: grid;
-  min-width: 244px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  min-width: 360px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 3px;
   padding: 3px;
   border: 1px solid var(--border);
@@ -6420,26 +6472,25 @@ button > svg {
 
 .human-interaction-banner {
   position: fixed;
-  right: clamp(16px, 3vw, 34px);
-  bottom: 18px;
+  bottom: 37px;
+  left: 50%;
   z-index: 30;
   width: min(640px, calc(100vw - 32px));
   max-height: min(52vh, 560px);
   overflow: auto;
   display: grid;
-  grid-template-columns: 30px minmax(0, 1fr) auto;
+  grid-template-columns: 30px minmax(0, 1fr);
   align-items: start;
   gap: 12px;
   margin: 0;
   padding: 13px 14px;
   border: 1px solid #355277;
-  border-left: 3px solid #6f9fe8;
   border-radius: 7px;
   background: #111b2d;
   box-shadow: 0 8px 22px rgb(0 0 0 / 12%);
+  transform: translateX(-50%);
 }
 
-.human-interaction-banner.permission { border-left-color: #d0a34a; }
 .human-interaction-icon { display: grid; width: 30px; height: 30px; place-items: center; border: 1px solid #3c5e88; border-radius: 6px; background: #182944; color: #9fc1f4; }
 .human-interaction-banner.permission .human-interaction-icon { border-color: #66522d; background: #2b2415; color: #e2b95c; }
 .human-interaction-icon svg { width: 16px; height: 16px; }
@@ -6455,24 +6506,13 @@ button > svg {
 .human-interaction-files { display: grid; gap: 3px; max-height: 108px; overflow: auto; }
 .human-interaction-files code { overflow-wrap: anywhere; color: #9fb4d1; font: 9px/1.4 var(--font-mono); }
 .human-interaction-copy textarea { min-height: 70px; resize: vertical; }
-.human-interaction-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: end; gap: 7px; }
-
-.human-interaction-banner::before {
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  background: rgb(2 6 23 / 18%);
-  content: '';
-  pointer-events: none;
-}
+.human-interaction-actions { display: flex; grid-column: 2; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 
 :root[data-theme='light'] .app-shell .human-interaction-banner {
   border-color: #c9d7e8;
-  border-left-color: #3974d0;
   background: #ffffff;
   box-shadow: 0 5px 16px rgb(15 23 42 / 8%);
 }
-:root[data-theme='light'] .app-shell .human-interaction-banner.permission { border-left-color: #b07b14; }
 :root[data-theme='light'] .app-shell .human-interaction-icon { border-color: #c9d7e8; background: #eef4fc; color: #3268c2; }
 :root[data-theme='light'] .app-shell .human-interaction-banner.permission .human-interaction-icon { border-color: #e8d8b1; background: #fff8e7; color: #9a6b0b; }
 :root[data-theme='light'] .app-shell .human-interaction-copy > b { color: #27364a; }
@@ -6482,7 +6522,15 @@ button > svg {
 :root[data-theme='light'] .app-shell .human-interaction-files code { color: #536b91; }
 
 @media (max-width: 700px) {
-  .approval-banner { right: 10px; bottom: 10px; width: calc(100vw - 20px); grid-template-columns: 30px minmax(0, 1fr); }
-  .human-interaction-banner { right: 10px; bottom: 10px; width: calc(100vw - 20px); grid-template-columns: 30px minmax(0, 1fr); }
-  .human-interaction-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .approval-banner { right: 10px; bottom: 35px; left: 10px; width: auto; margin: 0; grid-template-columns: 30px minmax(0, 1fr); transform: none; }
+  .human-interaction-banner { right: 10px; bottom: 35px; left: 10px; width: auto; margin: 0; grid-template-columns: 30px minmax(0, 1fr); transform: none; }
+  .human-interaction-actions { grid-column: 1 / -1; justify-content: stretch; }
+  .human-interaction-actions button { flex: 1; }
+}
+
+@media (max-height: 420px) {
+  .approval-banner,
+  .human-interaction-banner {
+    max-height: calc(100vh - 52px);
+  }
 }

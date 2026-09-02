@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { importProject, loadProject } from './project'
 import { saveExecutorConfigs } from './executor-config'
-import { answerRunInteraction, approveRun, configureRunManagerForTests, getRun, pauseRun, requestDeliveryApproval, requestRunInteraction, resumeInterruptedRuns, resumeRun, retryRun, startRun, steerRun, validateRunGraph } from './run-manager'
+import { answerRunInteraction, approveRun, configureRunManagerForTests, getRun, pauseRun, readArtifactPayload, requestDeliveryApproval, requestRunInteraction, resumeInterruptedRuns, resumeRun, retryRun, reviseArtifactPayload, startRun, steerRun, validateRunGraph } from './run-manager'
 
 const execFileAsync = promisify(execFile)
 
@@ -47,6 +47,39 @@ test('validation records missing commands without failing a completed workflow',
     assert.equal(run.nodes.find(node => node.id === 'validation')?.state, 'success')
     assert.equal(run.lastFailure, undefined)
     assert.ok(run.artifacts.some(artifact => artifact.nodeId === 'validation' && artifact.type === 'test-report' && artifact.status === 'valid'))
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('editing an Artifact creates a validated immutable revision with lineage', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-revision-'))
+  const repository = join(root, 'fixture')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = join(root, 'state')
+  try {
+    await createGitFixture(repository, 'artifact-revision')
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    configureRunManagerForTests({ codexRunner: async () => 'Original document.' })
+
+    const started = await startRun({ nodes: [{ id: 'writer', kind: 'Agent', executorId: 'codex', outputType: 'agent-report', executionMode: 'read_only', prompt: 'Write a document.' }] })
+    const completed = await waitForRun(started.id, run => run.status === 'succeeded')
+    const source = completed.artifacts.find(artifact => artifact.type === 'agent-report')
+    assert.ok(source)
+    const original = await readArtifactPayload(completed.id, source.id) as { content: string }
+    const payload = { summary: 'Edited document', content: '# Edited\n\nUpdated content.', changedFiles: [] }
+    const revision = await reviseArtifactPayload(completed.id, source.id, payload)
+
+    assert.ok(revision)
+    assert.equal(revision.version, source.version + 1)
+    assert.deepEqual(revision.inputArtifactIds, [source.id])
+    assert.equal(revision.contentHash, createHash('sha256').update(JSON.stringify(payload, null, 2)).digest('hex'))
+    assert.equal(original.content, 'Original document.')
+    assert.deepEqual(await readArtifactPayload(completed.id, revision.id), payload)
+    assert.equal((await getRun(completed.id))?.artifacts.length, completed.artifacts.length + 1)
   } finally {
     configureRunManagerForTests()
     if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR

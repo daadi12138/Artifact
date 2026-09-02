@@ -2,11 +2,13 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import { createPortal } from 'react-dom'
-import { AlignHorizontalSpaceAround, Bot, Check, ChevronLeft, ChevronRight, Copy, Download, Ellipsis, Eye, Focus, FolderCog, History, LoaderCircle, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, Upload, Workflow, X } from 'lucide-react'
+import { AlignHorizontalSpaceAround, AppWindow, Bot, Check, ChevronLeft, ChevronRight, Copy, Download, Ellipsis, Eye, FilePenLine, FileText, Focus, FolderCog, Globe2, History, LoaderCircle, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, SquareTerminal, Upload, Workflow, X } from 'lucide-react'
 import artifactLogo from './assets/artifact-logo.png'
 import { ExecutorSettings, SettingsOverview } from './executor-settings'
 import { latestActivity, RunWorkspace, type RunWorkspaceRun } from './run-workspace'
+import { readPreference, writePreference } from './preferences'
 import { WorkflowLibraryView, type WorkflowRecordView, type WorkflowTemplateView } from './workflow-library'
+import { Workbench, type ArtifactWorkbenchTarget, type WorkbenchMode } from './workbench'
 
 type NodeState = 'idle' | 'running' | 'paused' | 'success' | 'waiting' | 'failed' | 'cancelled' | 'skipped'
 type WorkflowNode = { id: string; title: string; subtitle: string; kind: string; tone: string; state: NodeState; x: number; y: number; input?: string; output: string; executorId?: string; executionMode?: 'read_only' | 'workspace_write'; prompt?: string }
@@ -27,7 +29,8 @@ type LogPanelResizeState = { pointerId: number; startY: number; startHeight: num
 type Readiness = { ready: boolean; step: string; title: string; detail: string; action: string; target: 'project' | 'environment' | 'executors' | null }
 type WorkflowMode = 'library' | 'editor'
 type CompactPanel = 'sidebar' | 'inspector' | null
-type InterfaceTheme = 'dark' | 'light'
+type InterfaceTheme = 'system' | 'dark' | 'light'
+type ResolvedTheme = Exclude<InterfaceTheme, 'system'>
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null
@@ -76,7 +79,7 @@ const initialNodes: WorkflowNode[] = [
   { id: 'review', title: '代码交付', subtitle: 'Git Diff', kind: '交付', tone: 'slate', state: 'idle', x: 1228, y: 154, input: 'validation', output: 'git-diff' },
 ]
 const initialEdges: Edge[] = [{ from: 'requirement', to: 'ui-spec' }, { from: 'ui-spec', to: 'approval' }, { from: 'approval', to: 'implementation' }, { from: 'implementation', to: 'validation' }, { from: 'validation', to: 'review' }]
-const navItems = [{ id: 'workflow', label: '工作流', icon: Workflow }, { id: 'runs', label: '运行', icon: History }, { id: 'artifacts', label: 'Artifacts', icon: Package }, { id: 'settings', label: '项目设置', icon: Settings }]
+const navItems = [{ id: 'workflow', label: '工作流', icon: Workflow }, { id: 'runs', label: '运行', icon: History }, { id: 'artifacts', label: 'Artifacts', icon: Package }, { id: 'workbench', label: '工作台', icon: AppWindow }, { id: 'settings', label: '项目设置', icon: Settings }]
 const nodePresets = [{ kind: 'Agent', title: 'Agent 节点', subtitle: 'Custom Agent', tone: 'violet', output: 'agent-report', executionMode: 'read_only' as const }, { kind: '验证', title: '验证节点', subtitle: 'Confirmed Commands', tone: 'green', output: 'test-report' }, { kind: '审批', title: '审批节点', subtitle: 'Human Approval', tone: 'amber', output: 'approved-spec' }, { kind: '工具', title: '工具节点', subtitle: 'Local Tool', tone: 'blue', output: 'tool-result' }]
 const outputSchemas = ['requirement', 'ui-spec', 'approved-spec', 'agent-report', 'code-change', 'test-report', 'git-diff', 'tool-result']
 const defaultSidebarWidth = 218
@@ -170,7 +173,9 @@ function arrangeWorkflowNodes(nodes: WorkflowNode[], edges: Edge[]): WorkflowNod
 export default function HomePage() {
   const [activeView, setActiveView] = useState('settings')
   const [theme, setTheme] = useState<InterfaceTheme>('dark')
+  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>('dark')
   const [themeReady, setThemeReady] = useState(false)
+  const [chromePreferencesReady, setChromePreferencesReady] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [compactLayout, setCompactLayout] = useState(false)
   const [compactPanel, setCompactPanel] = useState<CompactPanel>(null)
@@ -197,6 +202,9 @@ export default function HomePage() {
   const [runId, setRunId] = useState<string | null>(null)
   const [runStatus, setRunStatus] = useState<string | null>(null)
   const [runHeaderContext, setRunHeaderContext] = useState<RunHeaderContext | null>(null)
+  const [workbenchMode, setWorkbenchMode] = useState<WorkbenchMode>('documents')
+  const [workbenchBrowserOpen, setWorkbenchBrowserOpen] = useState(false)
+  const [workbenchTarget, setWorkbenchTarget] = useState<ArtifactWorkbenchTarget | null>(null)
   const [pendingCommandApproval, setPendingCommandApproval] = useState<PendingCommandApproval | null>(null)
   const [workflowReady, setWorkflowReady] = useState(false)
   const [logs, setLogs] = useState<string[]>(['工作流已加载 · 核心交付链'])
@@ -219,37 +227,52 @@ export default function HomePage() {
   const projectName = projectLoading ? '读取中…' : project?.name ?? '未导入项目'
 
   useEffect(() => {
-    const savedTheme = window.localStorage.getItem('artifact.theme')
-    const nextTheme: InterfaceTheme = savedTheme === 'light' ? 'light' : 'dark'
-    document.documentElement.dataset.theme = nextTheme
-    document.documentElement.style.colorScheme = nextTheme
+    const savedTheme = readPreference('artifact.theme')
+    const nextTheme: InterfaceTheme = savedTheme === 'system' || savedTheme === 'light' ? savedTheme : 'dark'
+    const nextResolvedTheme: ResolvedTheme = nextTheme === 'system'
+      ? window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+      : nextTheme
+    document.documentElement.dataset.theme = nextResolvedTheme
+    document.documentElement.dataset.themePreference = nextTheme
+    document.documentElement.style.colorScheme = nextResolvedTheme
     setTheme(nextTheme)
+    setResolvedTheme(nextResolvedTheme)
     setThemeReady(true)
   }, [])
 
   useEffect(() => {
     if (!themeReady) return
-    window.localStorage.setItem('artifact.theme', theme)
-    document.documentElement.dataset.theme = theme
-    document.documentElement.style.colorScheme = theme
+    writePreference('artifact.theme', theme)
+    const systemTheme = window.matchMedia('(prefers-color-scheme: light)')
+    const applyTheme = () => {
+      const nextResolvedTheme: ResolvedTheme = theme === 'system' ? systemTheme.matches ? 'light' : 'dark' : theme
+      setResolvedTheme(nextResolvedTheme)
+      document.documentElement.dataset.theme = nextResolvedTheme
+      document.documentElement.dataset.themePreference = theme
+      document.documentElement.style.colorScheme = nextResolvedTheme
+    }
+    applyTheme()
+    if (theme !== 'system') return
+    systemTheme.addEventListener('change', applyTheme)
+    return () => systemTheme.removeEventListener('change', applyTheme)
   }, [theme, themeReady])
 
   useEffect(() => {
-    setSidebarCollapsed(window.localStorage.getItem('artifact.sidebar.collapsed') === 'true')
-    setInspectorVisible(window.localStorage.getItem('artifact.inspector.visible') !== 'false')
+    setSidebarCollapsed(readPreference('artifact.sidebar.collapsed') === 'true')
+    setInspectorVisible(readPreference('artifact.inspector.visible') !== 'false')
     const compactMedia = window.matchMedia('(max-width: 1180px)')
     const syncCompactLayout = () => {
       setCompactLayout(compactMedia.matches)
       if (!compactMedia.matches) setCompactPanel(null)
     }
     syncCompactLayout()
-    const savedWidth = Number.parseInt(window.localStorage.getItem('artifact.sidebar.width') ?? '', 10)
+    const savedWidth = Number.parseInt(readPreference('artifact.sidebar.width') ?? '', 10)
     if (Number.isFinite(savedWidth)) {
       const width = Math.max(minSidebarWidth, Math.min(maxSidebarWidth, savedWidth))
       sidebarWidthRef.current = width
       setSidebarWidth(width)
     }
-    const savedInspectorWidth = Number.parseInt(window.localStorage.getItem('artifact.inspector.width') ?? '', 10)
+    const savedInspectorWidth = Number.parseInt(readPreference('artifact.inspector.width') ?? '', 10)
     if (Number.isFinite(savedInspectorWidth)) {
       const width = Math.max(minInspectorWidth, Math.min(maxInspectorWidth, savedInspectorWidth))
       inspectorWidthRef.current = width
@@ -269,6 +292,7 @@ export default function HomePage() {
     }
     window.addEventListener('keydown', onKeyDown)
     compactMedia.addEventListener('change', syncCompactLayout)
+    setChromePreferencesReady(true)
     return () => {
       window.removeEventListener('keydown', onKeyDown)
       compactMedia.removeEventListener('change', syncCompactLayout)
@@ -276,12 +300,24 @@ export default function HomePage() {
   }, [])
 
   useEffect(() => {
-    window.localStorage.setItem('artifact.sidebar.collapsed', String(sidebarCollapsed))
-  }, [sidebarCollapsed])
+    const toggleBrowser = () => setWorkbenchBrowserOpen(current => !current)
+    window.addEventListener('artifact:workbench-browser-toggle', toggleBrowser)
+    return () => window.removeEventListener('artifact:workbench-browser-toggle', toggleBrowser)
+  }, [])
 
   useEffect(() => {
-    window.localStorage.setItem('artifact.inspector.visible', String(inspectorVisible))
-  }, [inspectorVisible])
+    window.dispatchEvent(new CustomEvent('artifact:workbench-browser-state', { detail: workbenchBrowserOpen }))
+  }, [workbenchBrowserOpen])
+
+  useEffect(() => {
+    if (!chromePreferencesReady) return
+    writePreference('artifact.sidebar.collapsed', String(sidebarCollapsed))
+  }, [chromePreferencesReady, sidebarCollapsed])
+
+  useEffect(() => {
+    if (!chromePreferencesReady) return
+    writePreference('artifact.inspector.visible', String(inspectorVisible))
+  }, [chromePreferencesReady, inspectorVisible])
 
   const closeCompactPanel = () => setCompactPanel(null)
   const toggleCompactPanel = (panel: Exclude<CompactPanel, null>) => {
@@ -372,7 +408,7 @@ export default function HomePage() {
     shellRef.current?.style.setProperty('--primary-sidebar-width', `${width}px`)
     if (persist) {
       setSidebarWidth(width)
-      window.localStorage.setItem('artifact.sidebar.width', String(width))
+      writePreference('artifact.sidebar.width', String(width))
     }
   }
 
@@ -422,7 +458,7 @@ export default function HomePage() {
     shellRef.current?.style.setProperty('--inspector-width', `${width}px`)
     if (persist) {
       setInspectorWidth(width)
-      window.localStorage.setItem('artifact.inspector.width', String(width))
+      writePreference('artifact.inspector.width', String(width))
     }
   }
 
@@ -628,7 +664,7 @@ export default function HomePage() {
 
   const navigateToView = (view: string) => {
     setActiveView(view)
-    try { window.localStorage.setItem(activeViewStorageKey, view) } catch { /* Storage may be unavailable. */ }
+    writePreference(activeViewStorageKey, view)
   }
   const openSetup = (target: Readiness['target'] = readiness.target) => {
     if (!target) return
@@ -645,7 +681,7 @@ export default function HomePage() {
   }
   useEffect(() => {
     try {
-      const savedView = window.localStorage.getItem(activeViewStorageKey)
+      const savedView = readPreference(activeViewStorageKey)
       if (savedView && navItems.some(item => item.id === savedView)) setActiveView(savedView)
     } catch { /* Storage may be unavailable. */ }
   }, [])
@@ -658,6 +694,13 @@ export default function HomePage() {
     applyWorkflowRecord(workflow)
     navigateToView('workflow')
     setWorkflowMode('editor')
+  }
+  const openArtifactWorkbench = (target: ArtifactWorkbenchTarget) => {
+    setWorkbenchTarget(target)
+    setWorkbenchMode('documents')
+    navigateToView('workbench')
+    if (compactLayout) closeCompactPanel()
+    else setSidebarCollapsed(false)
   }
   const createWorkflow = async (template: WorkflowTemplateView) => {
     setWorkflowBusyId(`create:${template.id}`)
@@ -773,7 +816,7 @@ export default function HomePage() {
     : activeView === 'workflow' && workflowMode === 'editor' ? selectedWorkflow?.draft.name : undefined
   const headerBranchName = runContextVisible ? runHeaderContext?.branchName : undefined
 
-  return <div ref={shellRef} className={`app-shell theme-${theme} view-${activeView} workflow-${workflowMode} ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${compactLayout ? 'compact-layout' : ''} ${activeCompactPanel ? `compact-panel-${activeCompactPanel}` : ''} ${hasInspector ? 'has-inspector' : ''}`} style={{ '--primary-sidebar-width': `${sidebarWidth}px`, '--inspector-width': `${inspectorWidth}px` } as CSSProperties}>
+  return <div ref={shellRef} className={`app-shell theme-${resolvedTheme} view-${activeView} workflow-${workflowMode} ${sidebarCollapsed ? 'sidebar-collapsed' : ''} ${compactLayout ? 'compact-layout' : ''} ${activeCompactPanel ? `compact-panel-${activeCompactPanel}` : ''} ${hasInspector ? 'has-inspector' : ''}`} style={{ '--primary-sidebar-width': `${sidebarWidth}px`, '--inspector-width': `${inspectorWidth}px` } as CSSProperties}>
     <aside className="activity-bar" aria-label="主导航">
       <div className="activity-brand"><img className="brand-mark" src={artifactLogo.src} width={30} height={30} alt="Artifact" draggable={false} /></div>
       <nav className="activity-nav">
@@ -791,6 +834,7 @@ export default function HomePage() {
         {activeView === 'workflow' && workflowMode === 'editor' && <><div className="context-summary"><span className="context-icon"><Workflow aria-hidden="true" /></span><div><b>{selectedWorkflow?.draft.name ?? '工作流编辑器'}</b><small>{nodes.length} 个节点 · {edges.length} 条连接</small></div></div><div className="context-metrics"><span>完成 <b>{completed}</b></span><span>状态 <b>{draftSaveState === 'saving' ? '保存中' : draftSaveState === 'error' ? '保存失败' : '已保存'}</b></span></div><button className="context-action" onClick={openWorkflowLibrary}>返回工作流库 <ChevronRight aria-hidden="true" /></button></>}
         {activeView === 'runs' && <><div className="context-summary"><span className="context-icon"><History aria-hidden="true" /></span><div><b>运行工作台</b><small>{runId ? `当前 ${runStatusLabel(runStatus)}` : '选择已发布版本开始'}</small></div></div><button className="context-action" onClick={openWorkflowLibrary}>打开工作流库 <ChevronRight aria-hidden="true" /></button></>}
         {activeView === 'artifacts' && <><div className="context-summary"><span className="context-icon"><Package aria-hidden="true" /></span><div><b>Artifact Registry</b><small>按 Schema 和运行保存产物</small></div></div><button className="context-action" onClick={() => selectView('runs')}>查看来源运行 <ChevronRight aria-hidden="true" /></button></>}
+        {activeView === 'workbench' && <><button className={`context-item ${workbenchMode === 'documents' ? 'active' : ''}`} onClick={() => setWorkbenchMode('documents')}><span className="context-icon"><FileText aria-hidden="true" /></span><span><b>文档</b><small>项目文件编辑与预览</small></span></button><button className={`context-item ${workbenchMode === 'terminal' ? 'active' : ''}`} onClick={() => setWorkbenchMode('terminal')}><span className="context-icon"><SquareTerminal aria-hidden="true" /></span><span><b>终端</b><small>当前项目交互式 Shell</small></span></button><button className={`context-item ${workbenchBrowserOpen ? 'active' : ''}`} onClick={() => setWorkbenchBrowserOpen(value => !value)}><span className="context-icon"><Globe2 aria-hidden="true" /></span><span><b>浏览器</b><small>固定显示在右侧</small></span></button></>}
         {activeView === 'settings' && <><button className={`context-item ${settingsPage === 'overview' ? 'active' : ''}`} onClick={() => setSettingsPage('overview')}><span className="context-icon"><FolderCog aria-hidden="true" /></span><span><b>项目与环境</b><small>项目、Worktree 与命令</small></span></button><button className={`context-item ${settingsPage === 'executors' ? 'active' : ''}`} onClick={() => setSettingsPage('executors')}><span className="context-icon"><Bot aria-hidden="true" /></span><span><b>运行时</b><small>状态、模型与连通性</small></span></button></>}
       </div>
       <div className="sidebar-bottom"><div className="runtime"><span className="online" />本地运行时</div></div>
@@ -798,7 +842,7 @@ export default function HomePage() {
     <button className="sidebar-resizer" type="button" role="separator" aria-label="调整主侧栏宽度" aria-orientation="vertical" aria-valuemin={minSidebarWidth} aria-valuemax={maxSidebarWidth} aria-valuenow={sidebarWidth} tabIndex={sidebarCollapsed ? -1 : 0} onPointerDown={startSidebarResize} onPointerMove={resizeSidebar} onPointerUp={finishSidebarResize} onPointerCancel={finishSidebarResize} onKeyDown={adjustSidebarWidth} onDoubleClick={() => updateSidebarWidth(defaultSidebarWidth)} />
     <main className="workspace">
       <header className="workspace-header"><div className="header-leading"><div className="breadcrumb"><span>{projectName}</span><i>/</i><b>{activeNavItem?.label}</b>{headerWorkflowName && <><i>/</i><b title={headerWorkflowName}>{headerWorkflowName}</b></>}{headerBranchName && <><i>/</i><code title={headerBranchName}>{headerBranchName}</code></>}</div></div><div className="header-actions">{activeView === 'workflow' && workflowMode === 'editor' && <span className={`saved ${draftSaveState}`}><i />{draftSaveState === 'saving' ? '保存中' : draftSaveState === 'error' ? '保存失败' : '已保存'}</span>}<span className={`header-runtime-badge ${headerRunStatus ?? 'ready'}`} title={headerRunStatus ? `当前运行：${runStatusLabel(headerRunStatus)}` : '本地运行时就绪'}><i />{headerRunStatus ? runStatusLabel(headerRunStatus) : '运行时就绪'}</span><button className="run-btn header-run-trigger" type="button" onClick={() => selectView('runs')} aria-current={activeView === 'runs' ? 'page' : undefined}><Play aria-hidden="true" />运行</button></div><input ref={importInputRef} type="file" accept="application/json" hidden onChange={event => { const file = event.target.files?.[0]; if (file) void importWorkflow(file); event.currentTarget.value = '' }} /></header>
-      {activeView === 'workflow' && workflowMode === 'library' ? <WorkflowLibraryView workflows={workflows} templates={templates} busyId={workflowBusyId} onCreate={template => void createWorkflow(template)} onEdit={openWorkflowEditor} onPublish={workflow => void publishWorkflow(workflow)} onLaunch={() => selectView('runs')} /> : activeView === 'workflow' ? <WorkflowView workflowName={selectedWorkflow?.draft.name ?? '工作流'} publishedRevision={selectedWorkflow?.published.at(-1)?.revision} saveState={draftSaveState} nodes={nodes} edges={edges} selectedId={selectedId} logs={logs} nodeActivities={nodeActivities} workflowReady={workflowReady && Boolean(selectedWorkflowId)} compactLayout={compactLayout} inspectorVisible={hasInspector} dragRef={dragRef} onSelect={setSelectedId} onInspect={openNodeInspector} onMove={setNodes} onConnect={connectSelectedTo} onAddNode={addNode} onArrange={arrangeWorkflow} onImport={() => importInputRef.current?.click()} onExport={exportWorkflow} onToggleInspector={toggleInspector} onBack={openWorkflowLibrary} onPublish={publishSelectedWorkflow} publishing={workflowBusyId === `publish:${selectedWorkflowId}`} /> : activeView === 'runs' ? <RunWorkspace workflows={workflows} onEditWorkflow={openWorkflowEditor} onRunContextChange={setRunHeaderContext} /> : activeView === 'artifacts' ? <ArtifactView /> : settingsPage === 'executors' ? <ExecutorSettings onBack={() => setSettingsPage('overview')} /> : <SettingsOverview onExecutors={() => setSettingsPage('executors')} onOpenWorkflow={openWorkflowLibrary} executorConfigured={executorOptions.some(executor => executor.connected)} theme={theme} onThemeChange={setTheme} />}
+      {activeView === 'workflow' && workflowMode === 'library' ? <WorkflowLibraryView workflows={workflows} templates={templates} busyId={workflowBusyId} onCreate={template => void createWorkflow(template)} onEdit={openWorkflowEditor} onPublish={workflow => void publishWorkflow(workflow)} onLaunch={() => selectView('runs')} /> : activeView === 'workflow' ? <WorkflowView workflowName={selectedWorkflow?.draft.name ?? '工作流'} publishedRevision={selectedWorkflow?.published.at(-1)?.revision} saveState={draftSaveState} nodes={nodes} edges={edges} selectedId={selectedId} logs={logs} nodeActivities={nodeActivities} workflowReady={workflowReady && Boolean(selectedWorkflowId)} compactLayout={compactLayout} inspectorVisible={hasInspector} dragRef={dragRef} onSelect={setSelectedId} onInspect={openNodeInspector} onMove={setNodes} onConnect={connectSelectedTo} onAddNode={addNode} onArrange={arrangeWorkflow} onImport={() => importInputRef.current?.click()} onExport={exportWorkflow} onToggleInspector={toggleInspector} onBack={openWorkflowLibrary} onPublish={publishSelectedWorkflow} publishing={workflowBusyId === `publish:${selectedWorkflowId}`} /> : activeView === 'runs' ? <RunWorkspace workflows={workflows} onEditWorkflow={openWorkflowEditor} onRunContextChange={setRunHeaderContext} /> : activeView === 'artifacts' ? <ArtifactView onEdit={openArtifactWorkbench} /> : activeView === 'workbench' ? <Workbench mode={workbenchMode} onModeChange={setWorkbenchMode} projectPath={project?.repositoryPath} target={workbenchTarget} browserOpen={workbenchBrowserOpen} onBrowserOpenChange={setWorkbenchBrowserOpen} /> : settingsPage === 'executors' ? <ExecutorSettings onBack={() => setSettingsPage('overview')} /> : <SettingsOverview onExecutors={() => setSettingsPage('executors')} onOpenWorkflow={openWorkflowLibrary} executorConfigured={executorOptions.some(executor => executor.connected)} theme={theme} onThemeChange={setTheme} />}
       <footer className="status-bar"><div className="status-group"><span className="status-item project-status"><i />{projectName}</span><span className="status-item">{runStatus ? runStatusLabel(runStatus) : '就绪'}</span></div><div className="status-group"><span className="status-item">本地运行时</span><span className="status-item">Artifact 0.1.0</span></div></footer>
     </main>
     {hasInspector && <>
@@ -834,6 +878,7 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [logPanelHeight, setLogPanelHeight] = useState(defaultLogPanelHeight)
   const [logPanelVisible, setLogPanelVisible] = useState(true)
+  const [logPanelPreferenceReady, setLogPanelPreferenceReady] = useState(false)
   const [logPanelResizing, setLogPanelResizing] = useState(false)
   const canvasRef = useRef<HTMLElement>(null)
   const toolbarRef = useRef<HTMLDivElement>(null)
@@ -854,7 +899,7 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
     const next = constrainLogPanelHeight(height)
     logPanelHeightRef.current = next
     setLogPanelHeight(next)
-    if (persist) window.localStorage.setItem('artifact.log-panel.height', String(next))
+    if (persist) writePreference('artifact.log-panel.height', String(next))
   }
 
   const startLogPanelResize = (event: React.PointerEvent<HTMLButtonElement>) => {
@@ -1090,14 +1135,16 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
   useEffect(() => () => { if (viewportTimerRef.current !== null) window.clearTimeout(viewportTimerRef.current) }, [])
 
   useEffect(() => {
-    const saved = Number.parseInt(window.localStorage.getItem('artifact.log-panel.height') ?? '', 10)
+    const saved = Number.parseInt(readPreference('artifact.log-panel.height') ?? '', 10)
     if (Number.isFinite(saved)) updateLogPanelHeight(saved, false)
-    setLogPanelVisible(window.localStorage.getItem('artifact.log-panel.visible') !== 'false')
+    setLogPanelVisible(readPreference('artifact.log-panel.visible') !== 'false')
+    setLogPanelPreferenceReady(true)
   }, [])
 
   useEffect(() => {
-    window.localStorage.setItem('artifact.log-panel.visible', String(logPanelVisible))
-  }, [logPanelVisible])
+    if (!logPanelPreferenceReady) return
+    writePreference('artifact.log-panel.visible', String(logPanelVisible))
+  }, [logPanelPreferenceReady, logPanelVisible])
 
   const toggleLibrary = () => {
     setShowLibrary(current => !current)
@@ -1151,7 +1198,7 @@ function WorkflowView(props: { workflowName: string; publishedRevision?: number;
   </>
 }
 
-function ArtifactView() {
+function ArtifactView({ onEdit }: { onEdit: (target: ArtifactWorkbenchTarget) => void }) {
   type RegistryArtifact = Artifact & {
     runId: string
     runStartedAt: string
@@ -1262,7 +1309,7 @@ function ArtifactView() {
     return <article className={`artifact-card ${statusTone(artifact)}`} key={key}>
       <header><span className="artifact-card-icon"><Package aria-hidden="true" /></span><div><span className="section-kicker">节点 · {artifact.node?.id ?? artifact.nodeId}</span><h2 title={artifact.type}>{artifact.type} <small>v{artifact.version ?? 1}</small></h2></div><em className={`status-pill ${statusTone(artifact)}`}>{artifact.status}</em></header>
       <dl className="artifact-card-meta"><div><dt>输出类型</dt><dd title={artifact.node?.outputType ?? artifact.type}>{artifact.node?.outputType ?? artifact.type}</dd></div><div><dt>Schema</dt><dd title={`${artifact.schemaId ?? 'artifact'} v${artifact.schemaVersion ?? 1}`}>{artifact.schemaId ?? 'artifact'} v{artifact.schemaVersion ?? 1}</dd></div><div><dt>SHA-256</dt><dd><code title={artifact.contentHash}>{artifact.contentHash.slice(0, 16)}</code></dd></div><div className="artifact-created-at"><dt>创建时间</dt><dd>{formatTime(artifact.createdAt)}</dd></div></dl>
-      <footer><code className="artifact-uri" title={uri}>{uri}</code><div className="artifact-card-actions"><button className="header-icon-button" type="button" title="预览 Artifact" aria-label="预览 Artifact" onClick={() => void open(artifact)}><Eye aria-hidden="true" /></button><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(artifact)}>{copiedKey === key ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(artifact)}><Download aria-hidden="true" /></button></div></footer>
+      <footer><code className="artifact-uri" title={uri}>{uri}</code><div className="artifact-card-actions"><button className="header-icon-button" type="button" title="在工作台编辑" aria-label="在工作台编辑" onClick={() => onEdit({ runId: artifact.runId, artifactId: artifact.id })}><FilePenLine aria-hidden="true" /></button><button className="header-icon-button" type="button" title="预览 Artifact" aria-label="预览 Artifact" onClick={() => void open(artifact)}><Eye aria-hidden="true" /></button><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(artifact)}>{copiedKey === key ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(artifact)}><Download aria-hidden="true" /></button></div></footer>
     </article>
   }
   return <section className="content-view artifact-registry">
@@ -1273,7 +1320,7 @@ function ArtifactView() {
       <summary className="artifact-run-group-header"><ChevronRight className="artifact-collapse-icon" aria-hidden="true" /><div className="artifact-run-group-title"><span className="artifact-group-icon"><Workflow aria-hidden="true" /></span><div><span className="section-kicker">流程实例</span><h2 title={runGroup.workflow?.workflowName ?? '历史运行'}>{runGroup.workflow?.workflowName ?? '历史运行'} <small>{runGroup.workflow ? `· v${runGroup.workflow.revision}` : '· 未关联流程'}</small></h2><p><code title={runGroup.runId}>{shortRunId(runGroup.runId)}</code><span>开始于 {formatTime(runGroup.runStartedAt)}</span></p></div></div><span className="artifact-group-count">{runGroup.artifacts.length} 个产物</span></summary>
       <div className="artifact-node-groups">{runGroup.nodeGroups.map(nodeGroup => <details className="artifact-node-group" key={nodeGroup.type} open><summary><ChevronRight className="artifact-collapse-icon" aria-hidden="true" /><div><span className="section-kicker">节点类型</span><h3>{nodeGroup.type}</h3></div><span>{nodeGroup.artifacts.length} 个版本</span></summary><div className="artifact-grid">{nodeGroup.artifacts.map(renderArtifactCard)}</div></details>)}</div>
     </details>)}</div> : <div className="empty-state">没有匹配此状态的 Artifact。</div>}
-    {detail && <DetailPanel variant="modal" title={`${detail.artifact.type} v${detail.artifact.version ?? 1}`} onClose={() => setDetail(null)}><div className="artifact-detail-actions"><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(detail.artifact)}>{copiedKey === artifactKey(detail.artifact) ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(detail.artifact)}><Download aria-hidden="true" /></button></div><div className="artifact-detail-meta"><span>所属流程</span><strong title={workflowName(detail.artifact)}>{workflowName(detail.artifact)} · {workflowVersion(detail.artifact)}</strong><span>所属节点</span><strong title={nodeSummary(detail.artifact)}>{nodeSummary(detail.artifact)}</strong><span>Run</span><code title={detail.artifact.runId}>{detail.artifact.runId}</code><span>Artifact URI</span><code title={artifactUri(detail.artifact)}>{artifactUri(detail.artifact)}</code><span>上游输入</span><div className="lineage-list">{detail.artifact.inputArtifactIds?.length ? detail.artifact.inputArtifactIds.map(id => <button key={id} onClick={() => { const upstream = artifacts.find(artifact => artifact.id === id); if (upstream) void open(upstream) }}>{id}</button>) : <em>无上游 Artifact</em>}</div></div><pre>{JSON.stringify(detail.payload, null, 2)}</pre></DetailPanel>}
+    {detail && <DetailPanel variant="modal" title={`${detail.artifact.type} v${detail.artifact.version ?? 1}`} onClose={() => setDetail(null)}><div className="artifact-detail-actions"><button className="ghost-btn" type="button" onClick={() => onEdit({ runId: detail.artifact.runId, artifactId: detail.artifact.id })}><FilePenLine aria-hidden="true" />在工作台编辑</button><button className="header-icon-button" type="button" title="复制 Artifact URI" aria-label="复制 Artifact URI" onClick={() => void copyArtifactUri(detail.artifact)}>{copiedKey === artifactKey(detail.artifact) ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="header-icon-button" type="button" title="下载 Artifact 快照" aria-label="下载 Artifact 快照" onClick={() => void downloadArtifact(detail.artifact)}><Download aria-hidden="true" /></button></div><div className="artifact-detail-meta"><span>所属流程</span><strong title={workflowName(detail.artifact)}>{workflowName(detail.artifact)} · {workflowVersion(detail.artifact)}</strong><span>所属节点</span><strong title={nodeSummary(detail.artifact)}>{nodeSummary(detail.artifact)}</strong><span>Run</span><code title={detail.artifact.runId}>{detail.artifact.runId}</code><span>Artifact URI</span><code title={artifactUri(detail.artifact)}>{artifactUri(detail.artifact)}</code><span>上游输入</span><div className="lineage-list">{detail.artifact.inputArtifactIds?.length ? detail.artifact.inputArtifactIds.map(id => <button key={id} onClick={() => { const upstream = artifacts.find(artifact => artifact.id === id); if (upstream) void open(upstream) }}>{id}</button>) : <em>无上游 Artifact</em>}</div></div><pre>{JSON.stringify(detail.payload, null, 2)}</pre></DetailPanel>}
   </section>
 }
 
