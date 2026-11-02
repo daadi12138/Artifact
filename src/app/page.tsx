@@ -1,9 +1,8 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
-import Link from 'next/link'
 import { createPortal } from 'react-dom'
-import { AlignHorizontalSpaceAround, AppWindow, Bot, Check, ChevronLeft, ChevronRight, Compass, Copy, Download, Ellipsis, Eye, FilePenLine, FileText, Focus, FolderCog, Globe2, History, LoaderCircle, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, SquareTerminal, Upload, Workflow, X } from 'lucide-react'
+import { AlignHorizontalSpaceAround, AppWindow, Bot, Check, ChevronLeft, ChevronRight, Copy, Download, Ellipsis, Eye, FilePenLine, FileText, Focus, FolderCog, Globe2, History, LoaderCircle, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, SquareTerminal, Upload, Workflow, X } from 'lucide-react'
 import artifactLogo from './assets/artifact-logo.png'
 import { ExecutorSettings, SettingsOverview } from './executor-settings'
 import { latestActivity, RunWorkspace, type RunWorkspaceRun } from './run-workspace'
@@ -821,7 +820,7 @@ export default function HomePage() {
     <aside className="activity-bar" aria-label="主导航">
       <div className="activity-brand"><img className="brand-mark" src={artifactLogo.src} width={30} height={30} alt="Artifact" draggable={false} /></div>
       <nav className="activity-nav">
-        {navItems.map(item => { const Icon = item.icon; return <button key={item.id} title={item.label} aria-label={item.label} aria-current={activeView === item.id ? 'page' : undefined} className={activeView === item.id ? 'activity-item active' : 'activity-item'} onClick={() => selectView(item.id)}><Icon aria-hidden="true" /></button> })}<Link className="activity-item gridscape-link" href="/gridscape" title="GRIDSCAPE 概念画布" aria-label="GRIDSCAPE 概念画布"><Compass aria-hidden="true" /></Link>
+        {navItems.map(item => { const Icon = item.icon; return <button key={item.id} title={item.label} aria-label={item.label} aria-current={activeView === item.id ? 'page' : undefined} className={activeView === item.id ? 'activity-item active' : 'activity-item'} onClick={() => selectView(item.id)}><Icon aria-hidden="true" /></button> })}
       </nav>
       <div className="activity-bottom"><button className="activity-item" title="收起或展开侧栏" aria-label="收起或展开侧栏" aria-expanded={compactLayout ? activeCompactPanel === 'sidebar' : !sidebarCollapsed} onClick={toggleSidebar}>{compactLayout ? activeCompactPanel === 'sidebar' ? <PanelLeftClose aria-hidden="true" /> : <PanelLeftOpen aria-hidden="true" /> : sidebarCollapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}</button></div>
     </aside>

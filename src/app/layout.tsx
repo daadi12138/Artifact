@@ -1,6 +1,5 @@
 import type { Metadata } from 'next'
 import './styles.css'
-import './canvas.css'
 import './executor-settings.css'
 import './chrome.css'
 import './mission-control.css'

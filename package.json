@@ -2,7 +2,7 @@
   "name": "artifact",
   "version": "0.1.0",
   "private": true,
-  "description": "Local-first coding-agent workflow console with an integrated Gemini spatial concept canvas",
+  "description": "Local-first coding-agent workflow console with versioned artifacts and approval gates",
   "author": "Artifact Contributors",
   "main": "dist-electron/electron/main.js",
   "bin": {

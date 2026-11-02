@@ -205,7 +205,7 @@ function RunHistoryRail({ runs, selectedRunId, onSelect, className = '', childre
   const [query, setQuery] = useState('')
   const activeRuns = runs.filter(run => runGroup(run.status) === 'active')
   const groups = [
-    { id: 'active', label: '正在运行', runs: activeRuns },
+    { id: activeRuns.length > 1 ? 'parallel' : 'active', label: activeRuns.length > 1 ? '并行任务' : '正在运行', runs: activeRuns },
     { id: 'attention', label: '需要处理', runs: runs.filter(run => runGroup(run.status) === 'attention') },
     { id: 'history', label: '历史任务', runs: runs.filter(run => runGroup(run.status) === 'history') },
   ]

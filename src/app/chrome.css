@@ -2853,13 +2853,6 @@
   .run-workspace .spin { animation: none !important; }
 }
 
-/* Integrated GRIDSCAPE route entry */
 .activity-item {
   cursor: pointer;
-}
-
-.activity-item.gridscape-link {
-  margin-top: 4px;
-  border-top: 1px solid #e1e3e7;
-  border-radius: 0;
 }
