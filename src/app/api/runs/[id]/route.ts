@@ -1,4 +1,4 @@
-import { answerRunInteraction, approveRun, cancelRun, getRun, pauseRun, rejectRun, requestDeliveryApproval, requestRunInteraction, resumeRun, retryRun, steerRun, type HumanInteractionKind, type HumanInteractionOption, type HumanInteractionSource } from '@artifact/core'
+import { answerRunInteraction, approveRun, cancelRun, getRun, pauseRun, rejectRun, requestDeliveryApproval, requestRunInteraction, restoreDeletedDeliveryFiles, resumeRun, retryRun, steerRun, type HumanInteractionKind, type HumanInteractionOption, type HumanInteractionSource } from '@artifact/core'
 
 export async function GET(_request: Request, context: { params: Promise<{ id: string }> }) { const { id } = await context.params; const run = await getRun(id); return run ? Response.json(run) : Response.json({ error: 'Run not found' }, { status: 404 }) }
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
@@ -41,6 +41,10 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   }
   if (body.action === 'request_delivery') {
     try { const run = await requestDeliveryApproval(id); return run ? Response.json(run) : Response.json({ error: 'Run not found' }, { status: 404 }) }
+    catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 }) }
+  }
+  if (body.action === 'restore_deleted') {
+    try { const run = await restoreDeletedDeliveryFiles(id); return run ? Response.json(run) : Response.json({ error: 'Run not found' }, { status: 404 }) }
     catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 }) }
   }
   const actions = { approve: approveRun, reject: rejectRun, cancel: cancelRun } as const

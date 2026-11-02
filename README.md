@@ -1,4 +1,4 @@
-# Artifact
+# Artifact + GRIDSCAPE
 
 Artifact is a local-first workflow console for coordinating coding agents through versioned outputs, approval gates, and a visual DAG.
 
@@ -9,6 +9,29 @@ Requirements: Node.js 20+ and npm. Codex is optional, but required for real Agen
 ```bash
 npm install
 npm run dev
+```
+
+## Integrated GRIDSCAPE mode
+
+This repository also includes GRIDSCAPE at `/gridscape`, an infinite spatial concept canvas powered by Gemini.
+
+- `/` opens the original Artifact workflow console.
+- `/gridscape` opens the concept canvas.
+- The compass icon in Artifact's left activity bar switches to GRIDSCAPE.
+- GRIDSCAPE generates Markdown explanations, three follow-up prompts, and black-and-white editorial images.
+- Its **Send to Artifact** action converts the current concept map into a new Artifact workflow draft, preserving node positions and parent-child edges.
+
+GRIDSCAPE requires a Gemini API key. Copy `.env.example` to `.env.local` and set:
+
+```text
+GEMINI_API_KEY="YOUR_GEMINI_API_KEY"
+```
+
+Optional model overrides:
+
+```text
+GEMINI_TEXT_MODEL="gemini-3.1-flash-lite"
+GEMINI_IMAGE_MODEL="gemini-3.1-flash-lite-image"
 ```
 
 Open `http://localhost:3000`. For a production build:

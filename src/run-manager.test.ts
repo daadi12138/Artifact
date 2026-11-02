@@ -8,7 +8,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { importProject, loadProject } from './project'
 import { saveExecutorConfigs } from './executor-config'
-import { answerRunInteraction, approveRun, configureRunManagerForTests, getRun, pauseRun, readArtifactPayload, requestDeliveryApproval, requestRunInteraction, resumeInterruptedRuns, resumeRun, retryRun, reviseArtifactPayload, startRun, steerRun, validateRunGraph } from './run-manager'
+import { answerRunInteraction, approveRun, configureRunManagerForTests, getRun, pauseRun, readArtifactPayload, requestDeliveryApproval, requestRunInteraction, restoreDeletedDeliveryFiles, resumeInterruptedRuns, resumeRun, retryRun, reviseArtifactPayload, startRun, steerRun, validateRunGraph } from './run-manager'
 
 const execFileAsync = promisify(execFile)
 
@@ -316,6 +316,36 @@ test('delivery blocks a project file changed after the run began', async () => {
     assert.equal(run?.status, 'awaiting_delivery')
     assert.ok(run?.deliveryApproval?.changes.some(change => change.path === 'shared.ts' && change.conflicts.length > 0))
     assert.equal(await readFile(join(repository, 'shared.ts'), 'utf8'), 'export const version = "project"\n')
+  } finally {
+    configureRunManagerForTests()
+    if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR
+    else process.env.ARTIFACT_STATE_DIR = previousState
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('delivery can restore target files deleted during a run before rechecking conflicts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'artifact-delivery-restore-'))
+  const repository = join(root, 'fixture')
+  const previousState = process.env.ARTIFACT_STATE_DIR
+  process.env.ARTIFACT_STATE_DIR = join(root, 'state')
+  try {
+    await createGitFixture(repository, 'delivery-restore')
+    await writeFile(join(repository, 'shared.ts'), 'export const version = "base"\n')
+    await execFileAsync('git', ['add', 'shared.ts'], { cwd: repository })
+    await execFileAsync('git', ['-c', 'user.name=Artifact Test', '-c', 'user.email=artifact@example.test', 'commit', '-m', 'shared file'], { cwd: repository })
+    await importProject(repository)
+    await saveExecutorConfigs([{ id: 'codex', name: 'Codex', type: 'test', version: 'fixture', status: 'available', icon: 'C', tone: 'blue', path: 'codex', model: '', profile: 'coding-safe', capabilities: [], authentication: 'authenticated' }])
+    configureRunManagerForTests({ codexRunner: async input => { await writeFile(join(input.cwd, 'shared.ts'), 'export const version = "worktree"\n'); return 'Changed the shared file.' } })
+    const started = await startRun({ nodes: [{ id: 'implementation', kind: 'Agent', executorId: 'codex', outputType: 'code-change', executionMode: 'workspace_write', prompt: 'Change the shared file.' }] })
+    const waiting = await waitForRun(started.id, value => value.status === 'awaiting_delivery')
+    await rm(join(repository, 'shared.ts'))
+    const blocked = await approveRun(waiting.id)
+    assert.equal(blocked?.status, 'awaiting_delivery')
+    assert.equal(await readFile(join(repository, 'shared.ts'), 'utf8').catch(() => null), null)
+    const restored = await restoreDeletedDeliveryFiles(waiting.id)
+    assert.equal(await readFile(join(repository, 'shared.ts'), 'utf8'), 'export const version = "base"\n')
+    assert.equal(restored?.deliveryApproval?.changes.some(change => change.conflicts.length > 0), false)
   } finally {
     configureRunManagerForTests()
     if (previousState === undefined) delete process.env.ARTIFACT_STATE_DIR

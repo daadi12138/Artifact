@@ -7,10 +7,19 @@ import {
   updateWorkflowDraft,
   workflowTemplateIds,
   workflowTemplates,
-  type WorkflowCanvasDefinition,
-  type WorkflowInputContract,
   type WorkflowTemplateId,
 } from '@artifact/core'
+import { z } from 'zod'
+
+const workflowNodeSchema = z.object({
+  id: z.string().trim().min(1).max(120), title: z.string().max(160), subtitle: z.string().max(160),
+  kind: z.string().trim().min(1).max(40), tone: z.string().max(40),
+  x: z.number().finite().min(-100_000).max(100_000), y: z.number().finite().min(-100_000).max(100_000),
+  input: z.string().max(120).optional(), output: z.string().trim().min(1).max(120),
+  executorId: z.string().trim().max(80).optional(), executionMode: z.enum(['read_only', 'workspace_write']).optional(), prompt: z.string().max(16_000).optional(),
+})
+const workflowEdgeSchema = z.object({ from: z.string().trim().min(1).max(120), to: z.string().trim().min(1).max(120) })
+const inputContractSchema = z.object({ text: z.boolean(), attachments: z.boolean(), webAssets: z.boolean(), description: z.string().max(2_000) })
 
 export async function GET() {
   const library = await loadWorkflowLibrary()
@@ -21,14 +30,7 @@ export async function GET() {
 
 export async function PUT(request: Request) {
   try {
-    const body = await request.json() as {
-      id?: string
-      name?: string
-      description?: string
-      inputContract?: WorkflowInputContract
-      nodes?: WorkflowCanvasDefinition['nodes']
-      edges?: WorkflowCanvasDefinition['edges']
-    }
+    const body = z.object({ id: z.string().trim().max(160).optional(), name: z.string().max(200).optional(), description: z.string().max(4_000).optional(), inputContract: inputContractSchema.optional(), nodes: z.array(workflowNodeSchema).max(200).optional(), edges: z.array(workflowEdgeSchema).max(400).optional() }).parse(await request.json())
     if (!body.nodes || !body.edges) return Response.json({ error: 'nodes and edges are required' }, { status: 400 })
     if (!body.id) return Response.json(await saveWorkflowDefinition({ nodes: body.nodes, edges: body.edges }))
     return Response.json(await updateWorkflowDraft(body.id, { name: body.name, description: body.description, inputContract: body.inputContract, nodes: body.nodes, edges: body.edges }))

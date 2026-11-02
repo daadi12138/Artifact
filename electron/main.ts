@@ -8,6 +8,7 @@ import { app, BrowserWindow, dialog, ipcMain, screen, shell, WebContentsView, ty
 import { spawn as spawnPty, type IPty } from 'node-pty'
 import { createProject, diagnoseProject, importProject, loadProject } from '../src/core/index'
 import { fitWindowBounds, parseDesktopWindowState, type DesktopWindowState } from '../src/window-state'
+import { managedTerminalDirectory } from '../src/run-worktree'
 
 let mainWindow: BrowserWindow | null = null
 let serverProcess: ChildProcess | null = null
@@ -334,8 +335,9 @@ async function terminalDirectory(requestedPath: unknown): Promise<string> {
   const target = await realpath(resolve(requested)).catch(() => null)
   if (target) {
     if (roots.some(root => isWithin(root, target))) return target
-    throw new Error('终端工作目录必须位于当前项目中')
+    return managedTerminalDirectory(requested, project.gitRoot, stateDirectory)
   }
+  if (typeof requestedPath === 'string' && requestedPath.trim()) throw new Error('指定的终端工作目录不存在，请刷新 Run 状态')
   const projectRoot = roots.find(root => {
     try { return statSync(root).isDirectory() } catch { return false }
   })

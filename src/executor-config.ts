@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process'
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { access, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { dirname, isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
@@ -189,7 +190,13 @@ export function mergeExecutorConfigs(configs: ExecutorConfig[]): ExecutorConfig[
 export async function saveExecutorConfigs(configs: ExecutorConfig[]): Promise<void> {
   const path = configPath()
   await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, JSON.stringify(mergeExecutorConfigs(configs), null, 2), 'utf8')
+  const temporary = `${path}.${randomUUID()}.tmp`
+  try {
+    await writeFile(temporary, JSON.stringify(mergeExecutorConfigs(configs), null, 2), 'utf8')
+    await rename(temporary, path)
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined)
+  }
 }
 
 export function executorDefinition(id: string): ExecutorDefinition | undefined {

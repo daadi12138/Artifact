@@ -418,7 +418,7 @@ function ArtifactWorkbench({ target }: { target?: ArtifactWorkbenchTarget | null
   </div>
 }
 
-function TerminalWorkbench({ active, projectPath }: { active: boolean; projectPath?: string }) {
+export function TerminalWorkbench({ active, projectPath }: { active: boolean; projectPath?: string }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<import('@xterm/xterm').Terminal | null>(null)
   const fitRef = useRef<import('@xterm/addon-fit').FitAddon | null>(null)

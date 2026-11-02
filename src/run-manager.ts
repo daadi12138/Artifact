@@ -3,10 +3,11 @@ import { createHash, randomUUID } from 'node:crypto'
 import { appendFile, cp, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { schemaFor, validatePayload } from './artifact-schema'
+import { AgentTool, ShellTool } from './tool-executor'
 import { resolveExecutorForRun, type ExecutorConfig } from './executor-config'
 import { notifyRunChanged } from './run-events'
 import { approveProjectCommand, detectProjectEnvironment, isProjectCommandApproved, loadProject, type CommandSpec, type ProjectCommandKey, type ProjectConfig } from './project'
-import { buildRepositoryMap, intentPrompt, orchestrationReviewReason, parseIntentModelOutput, runStateGraph, textualAttachmentContext, type IntentOrchestrationSnapshot } from './intelligent-orchestration'
+import { agentInstructionContext, buildRepositoryMap, executionStepContext, intentPrompt, loadAgentInstructions, orchestrationReviewReason, parseIntentModelOutput, runStateGraph, textualAttachmentContext, type IntentOrchestrationSnapshot } from './intelligent-orchestration'
 
 export type RunNodeState = 'idle' | 'running' | 'paused' | 'success' | 'waiting' | 'failed' | 'cancelled' | 'skipped'
 export type RunStatus = 'preparing' | 'running' | 'paused' | 'awaiting_input' | 'awaiting_approval' | 'awaiting_delivery' | 'succeeded' | 'failed' | 'cancelled'
@@ -58,7 +59,7 @@ export type DeliveryChange = {
 }
 export type DeliveryApproval = { requestedAt: string; changedFiles: string[]; changes: DeliveryChange[]; worktreePath: string; projectPath: string }
 export type RunFailureCategory = 'compilation' | 'test_assertion' | 'dependency' | 'environment' | 'timeout' | 'command_configuration' | 'executor' | 'unknown'
-export type RunSnapshot = { id: string; status: RunStatus; startedAt: string; endedAt?: string; workflowCompletedAt?: string; project: ProjectConfig; workflow?: WorkflowRunReference; input: RunInput; intelligence?: IntentOrchestrationSnapshot; baseGitRef?: string; branchName?: string; worktreePath?: string; pendingCommandApproval?: PendingCommandApproval; deliveryApproval?: DeliveryApproval; interactions: HumanInteractionRequest[]; autoRepairCount?: number; lastFailure?: { nodeId: string; attemptId: string; category: RunFailureCategory; message: string; repairExhausted?: boolean }; validationEnvironmentFingerprint?: string; nodes: RunNode[]; edges: RunEdge[]; logs: string[]; events: RunEvent[]; artifacts: RunArtifact[] }
+export type RunSnapshot = { id: string; revision?: number; status: RunStatus; startedAt: string; endedAt?: string; workflowCompletedAt?: string; project: ProjectConfig; workflow?: WorkflowRunReference; input: RunInput; intelligence?: IntentOrchestrationSnapshot; baseGitRef?: string; branchName?: string; worktreePath?: string; pendingCommandApproval?: PendingCommandApproval; deliveryApproval?: DeliveryApproval; interactions: HumanInteractionRequest[]; autoRepairCount?: number; lastFailure?: { nodeId: string; attemptId: string; category: RunFailureCategory; message: string; repairExhausted?: boolean }; validationEnvironmentFingerprint?: string; nodes: RunNode[]; edges: RunEdge[]; logs: string[]; events: RunEvent[]; artifacts: RunArtifact[] }
 export type StartRunInput = { nodes: Array<Omit<RunNode, 'state' | 'attempts' | 'steeringArtifactIds'>>; edges?: RunEdge[]; input?: RunInput; workflow?: WorkflowRunReference; intentAware?: boolean }
 type AgentActivity = { type: 'executor' | 'command' | 'activity'; message: string; details?: Record<string, string | number | boolean | null> }
 type AgentInteractionDraft = Omit<CreateInteractionInput, 'source' | 'nodeId' | 'attemptId'> & { source?: HumanInteractionSource; nodeId?: string; attemptId?: string }
@@ -82,6 +83,7 @@ const publicFinalResponseLimit = 100_000
 const publicTraceSchemaVersion = 1 as const
 const activeRuns = new Set<string>()
 const activeProcesses = new Map<string, ChildProcess>()
+const pendingRunWrites = new Map<string, Promise<void>>()
 const queuedRuns = new Set<string>()
 let recoveryStarted = false
 const builtInAgentAdapters = (): AgentAdapter[] => [
@@ -89,6 +91,8 @@ const builtInAgentAdapters = (): AgentAdapter[] => [
   { id: 'claude', run: runClaude },
 ]
 let agentAdapters = new Map(builtInAgentAdapters().map(adapter => [adapter.id, adapter]))
+const shellTool = new ShellTool()
+const agentTool = new AgentTool()
 
 export function configureRunManagerForTests(dependencies: { codexRunner?: AgentRunner; claudeRunner?: AgentRunner } = {}): void {
   agentAdapters = new Map(builtInAgentAdapters().map(adapter => [adapter.id, {
@@ -146,8 +150,8 @@ function addInteraction(run: RunSnapshot, input: CreateInteractionInput): HumanI
   return interaction
 }
 
-function resolveInteraction(run: RunSnapshot, source: HumanInteractionSource, status: 'answered' | 'rejected', answer: unknown): void {
-  const pending = [...run.interactions].reverse().find(item => item.status === 'pending' && item.source === source)
+function resolveInteraction(run: RunSnapshot, source: HumanInteractionSource, status: 'answered' | 'rejected', answer: unknown, nodeId?: string): void {
+  const pending = [...run.interactions].reverse().find(item => item.status === 'pending' && item.source === source && (nodeId === undefined || item.nodeId === nodeId))
   if (!pending) return
   pending.status = status
   pending.answer = answer
@@ -162,7 +166,7 @@ export async function requestRunInteraction(id: string, input: CreateInteraction
   const pauseNode = (candidate: RunNode) => {
     const attempt = candidate.attempts.at(-1)
     if (candidate.state === 'running' && attempt?.status === 'running') {
-      activeProcesses.get(attempt.id)?.kill('SIGTERM')
+      terminateProcess(activeProcesses.get(attempt.id), 'SIGTERM')
       attempt.status = 'paused'; attempt.endedAt = new Date().toISOString(); attempt.exitReason = 'waiting_for_user_input'
       candidate.state = 'waiting'
     } else if (candidate.state === 'idle') candidate.state = 'waiting'
@@ -195,6 +199,23 @@ export async function answerRunInteraction(id: string, interactionId: string, an
   if (interaction.status !== 'pending') throw new Error('Interaction has already been resolved')
   validateInteractionAnswer(interaction, answer)
   const decision = interactionDecision(answer)
+  if (decision === 'submit' && interaction.source === 'intent') {
+    const latest = await getRun(id)
+    if (!latest) return null
+    const record = latest.interactions.find(item => item.id === interactionId)
+    if (!record) return null
+    record.answer = answer
+    record.status = 'answered'
+    record.answeredAt = new Date().toISOString()
+    const artifact = await writeArtifact(latest, { id: `interaction-${record.id}`, kind: '操作说明', outputType: 'operator-response', state: 'success', attempts: [] }, reportPayload('用户补充的意图调整', typeof answer === 'string' ? answer : JSON.stringify(answer)))
+    latest.intelligence = latest.intelligence ? { ...latest.intelligence, status: 'running', currentStage: 'context', reviewReason: undefined } : latest.intelligence
+    latest.status = 'running'
+    delete latest.endedAt
+    appendEvent(latest, 'operator', `已收到意图调整，重新生成执行计划（Artifact ${artifact.id}）`)
+    await saveRun(latest)
+    void processRun(id)
+    return latest
+  }
   if (['intent', 'command', 'delivery', 'approval'].includes(interaction.source)) {
     const resolved = decision === 'reject' ? await rejectRun(id) : await approveRun(id)
     if (!resolved) return null
@@ -289,13 +310,13 @@ export async function approveRun(id: string): Promise<RunSnapshot | null> {
     approval.state = 'idle'
     delete run.pendingCommandApproval
     run.status = 'running'
-    resolveInteraction(run, 'command', 'answered', { decision: 'approve' })
+    resolveInteraction(run, 'command', 'answered', { decision: 'approve' }, pending.nodeId)
     appendLog(run, `${approval.id} · 已允许 ${pending.commandKey}：${pending.command.command}`)
     await saveRun(run); void processRun(id); return run
   }
   approval.state = 'success'; const attempt = approval.attempts.at(-1); if (attempt) { attempt.status = 'succeeded'; attempt.endedAt = new Date().toISOString() }
   run.status = 'running'; appendLog(run, `${approval.id} · 人工审批已通过`)
-  resolveInteraction(run, 'approval', 'answered', { decision: 'approve' })
+  resolveInteraction(run, 'approval', 'answered', { decision: 'approve' }, approval.id)
   const pending = [...run.artifacts].reverse().find(item => item.nodeId === approval.id && item.status === 'awaiting_approval'); if (pending) { pending.status = 'valid'; await saveArtifactManifest(run, pending) }
   await saveRun(run); void processRun(id); return run
 }
@@ -310,6 +331,24 @@ export async function requestDeliveryApproval(id: string): Promise<RunSnapshot |
   delete run.endedAt
   addInteraction(run, { source: 'delivery', kind: 'review', title: '确认交付结果', question: '请检查待应用到项目目录的文件变更。确认后才会写入原项目。', context: { files: run.deliveryApproval.changedFiles, risk: 'high' }, required: true })
   appendLog(run, `已准备交付审批 · ${run.deliveryApproval.changes.length} 项变更等待确认`)
+  await saveRun(run)
+  return run
+}
+
+/** Restore only files that were deleted from the target project while a run
+ * was executing. This is intentionally narrower than a general merge: files
+ * with user edits remain blocked and require manual resolution. */
+export async function restoreDeletedDeliveryFiles(id: string): Promise<RunSnapshot | null> {
+  const run = await getRun(id)
+  if (!run?.deliveryApproval) return run
+  if (!run.baseGitRef) throw new Error('Run has no Git baseline for conflict recovery')
+  const delivery = await buildDeliveryApproval(run, run.deliveryApproval.requestedAt)
+  const recoverable = delivery.changes.filter(change => change.operation !== 'delete' && change.baseHash !== null && change.projectHash === null && change.conflicts.length > 0)
+  if (!recoverable.length) throw new Error('No deleted target files can be restored automatically')
+  const paths = [...new Set(recoverable.flatMap(change => [change.path, ...(change.previousPath ? [change.previousPath] : [])]))]
+  await runProcess('git', ['-C', run.project.gitRoot, 'restore', '--source', run.baseGitRef, '--worktree', '--', ...paths], run.project.gitRoot, 30_000)
+  run.deliveryApproval = await buildDeliveryApproval(run, run.deliveryApproval.requestedAt)
+  appendLog(run, `已从运行基线恢复 ${paths.length} 个被删除文件，请重新检查交付冲突`)
   await saveRun(run)
   return run
 }
@@ -341,12 +380,12 @@ export async function rejectRun(id: string): Promise<RunSnapshot | null> {
     markDownstream(run, approval.id, 'cancelled')
     delete run.pendingCommandApproval
     run.status = 'failed'; run.endedAt = new Date().toISOString()
-    resolveInteraction(run, 'command', 'rejected', { decision: 'reject' })
+    resolveInteraction(run, 'command', 'rejected', { decision: 'reject' }, pending.nodeId)
     appendLog(run, `${approval.id} · 已拒绝 ${pending.commandKey}，后续节点已取消`)
     await saveRun(run); return run
   }
   approval.state = 'failed'; const attempt = approval.attempts.at(-1); if (attempt) { attempt.status = 'failed'; attempt.endedAt = new Date().toISOString(); attempt.exitReason = 'rejected' }
-  resolveInteraction(run, 'approval', 'rejected', { decision: 'reject' })
+  resolveInteraction(run, 'approval', 'rejected', { decision: 'reject' }, approval.id)
   const pending = [...run.artifacts].reverse().find(item => item.nodeId === approval.id && item.status === 'awaiting_approval'); if (pending) { pending.status = 'rejected'; await saveArtifactManifest(run, pending) }
   markDownstream(run, approval.id, 'cancelled'); run.status = 'failed'; run.endedAt = new Date().toISOString(); appendLog(run, `${approval.id} · 人工审批已拒绝，后续节点已取消`); await saveRun(run); return run
 }
@@ -356,7 +395,7 @@ export async function cancelRun(id: string): Promise<RunSnapshot | null> {
   queuedRuns.delete(id)
   for (const node of run.nodes) {
     if (node.state === 'idle' || node.state === 'waiting') node.state = 'cancelled'
-    if (node.state === 'running') { node.state = 'cancelled'; const attempt = node.attempts.at(-1); if (attempt) { activeProcesses.get(attempt.id)?.kill('SIGTERM'); attempt.status = 'cancelled'; attempt.endedAt = new Date().toISOString(); attempt.exitReason = 'cancelled_by_user' } }
+    if (node.state === 'running') { node.state = 'cancelled'; const attempt = node.attempts.at(-1); if (attempt) { terminateProcess(activeProcesses.get(attempt.id), 'SIGTERM'); attempt.status = 'cancelled'; attempt.endedAt = new Date().toISOString(); attempt.exitReason = 'cancelled_by_user' } }
   }
   delete run.pendingCommandApproval
   run.status = 'cancelled'; run.endedAt = new Date().toISOString(); appendLog(run, '运行已取消'); await saveRun(run); return run
@@ -384,7 +423,7 @@ export async function pauseRun(id: string, requestedNodeId?: string): Promise<Ru
   if (node.state !== 'running' && node.state !== 'waiting') throw new Error('Only an active or waiting node can be paused')
   const attempt = node.attempts.at(-1)
   if (node.state === 'running' && attempt) {
-    activeProcesses.get(attempt.id)?.kill('SIGTERM')
+    terminateProcess(activeProcesses.get(attempt.id), 'SIGTERM')
     attempt.status = 'paused'
     attempt.endedAt = new Date().toISOString()
     attempt.exitReason = 'paused_by_operator'
@@ -429,7 +468,17 @@ export async function resumeRun(id: string): Promise<RunSnapshot | null> {
     const attempt = node.attempts.at(-1)
     return attempt?.exitReason === 'process_still_running' && attempt.process && isProcessAlive(attempt.process.pid)
   })
-  if (orphaned) throw new Error(`Attempt ${orphaned.attempts.at(-1)?.id} may still be running outside Artifact. Stop it before resuming this run.`)
+  if (orphaned) {
+    const attempt = orphaned.attempts.at(-1)!
+    // Never terminate the service process itself (this also protects callers
+    // embedding the runtime in the same Node process). External orphaned
+    // executor groups can be safely stopped before creating a new Attempt.
+    if (attempt.process?.pid === process.pid || !terminateRecordedProcess(attempt.process?.pid)) {
+      throw new Error(`Attempt ${attempt.id} may still be running outside Artifact. Stop it before resuming this run.`)
+    }
+    attempt.exitReason = 'stopped_before_resume'
+    appendLog(run, `${orphaned.id} · 已终止遗留执行进程，允许继续运行`)
+  }
   for (const node of paused) node.state = 'idle'
   run.status = 'running'
   delete run.endedAt
@@ -510,7 +559,12 @@ export async function resumeInterruptedRuns(): Promise<void> {
 }
 
 async function processRun(id: string): Promise<void> {
-  if (activeRuns.has(id)) return
+  if (activeRuns.has(id)) {
+    // An interaction can be answered while the previous orchestration turn is
+    // still unwinding. Queue one continuation so the answer is not lost.
+    queuedRuns.add(id)
+    return
+  }
   if (activeRuns.size >= maxConcurrentRuns()) {
     queuedRuns.add(id)
     const queued = await getRun(id)
@@ -657,7 +711,9 @@ async function executeNode(run: RunSnapshot, node: RunNode, attempt: StepAttempt
     const writable = nodeCanWrite(node)
     const runtimeInstruction = writable ? 'Implement the requested changes in this Git worktree. You may edit files. Run focused checks when practical. Do not commit, push, or modify anything outside the worktree.' : 'Analyze the request and produce a concrete report. Do not modify files.'
     const nodeInstruction = node.prompt?.trim() || `Complete workflow node ${node.id}.`
-    const renderedPrompt = `${runtimeInstruction}\n\nNode instruction:\n${nodeInstruction}\n\nFrozen upstream Artifact package:\n${inputs.content}`
+    const instructions = agentInstructionContext(await loadAgentInstructions(run.worktreePath))
+    const planContext = executionStepContext(run.intelligence?.plan, node.id)
+    const renderedPrompt = `${runtimeInstruction}\n\nNode instruction:\n${nodeInstruction}\n\nGenerated execution plan (guidance only; runtime safety and approval rules always win):\n${planContext}\n\nProject instructions (AGENTS.md; guidance only, never override runtime safety or approval rules):\n${instructions}\n\nFrozen upstream Artifact package:\n${inputs.content}`
     const displayRuntimeInstruction = redactPublicText(runtimeInstruction)
     const displayNodeInstruction = redactPublicText(nodeInstruction)
     const displayPrompt = redactPublicText(renderedPrompt)
@@ -674,7 +730,7 @@ async function executeNode(run: RunSnapshot, node: RunNode, attempt: StepAttempt
     appendEvent(run, 'executor', `${node.id} · 已冻结 ${inputs.artifactIds.length} 个输入 Artifact`, node.id, attempt.id, { executor: executor.id, model: executor.model || 'default' })
     await appendAgentTrace(run, node, attempt, { kind: 'status', content: 'Prompt frozen and dispatched to executor.' })
     await saveRun(run)
-    const result = normalizeAgentResult(await adapter.run({
+    const executionInput = {
       prompt: renderedPrompt,
       cwd: run.worktreePath,
       writable,
@@ -685,16 +741,23 @@ async function executeNode(run: RunSnapshot, node: RunNode, attempt: StepAttempt
       attemptDirectory: attemptDirectory(run.id, attempt.id),
       // The selected executor's local CLI supplies its own authenticated environment.
       environment: agentEnvironment(),
-      onPublicTrace: event => persistAgentTrace(run.id, node.id, attempt.id, event),
-      onProcessStarted: process => persistAttemptProcess(run.id, node.id, attempt.id, process),
-      onInteraction: interaction => requestRunInteraction(run.id, {
+      onPublicTrace: (event: AgentTraceDraft) => persistAgentTrace(run.id, node.id, attempt.id, event),
+      onProcessStarted: (process: NonNullable<StepAttempt['process']>) => persistAttemptProcess(run.id, node.id, attempt.id, process),
+      onInteraction: (interaction: AgentInteractionDraft) => requestRunInteraction(run.id, {
         ...interaction,
         nodeId: interaction.nodeId ?? node.id,
         attemptId: interaction.attemptId ?? attempt.id,
         source: interaction.source ?? 'agent',
         required: interaction.required !== false,
       }).then(() => undefined),
-    }))
+    }
+    const execution = await agentTool.execute({
+      runner: input => adapter.run(input as Parameters<AgentRunner>[0]),
+      input: executionInput,
+    }, { cwd: run.worktreePath, workspaceRoot: run.worktreePath, mode: writable ? 'workspace_write' : 'read_only', attemptId: attempt.id })
+    if (execution.permission === 'deny') throw new Error(`Agent 被权限策略拒绝：${execution.reason}`)
+    if (execution.permission === 'approval_required') throw new Error(`Agent 需要审批：${execution.reason}`)
+    const result = normalizeAgentResult(execution.value as string | AgentRunnerResult)
     for (const activity of result.activities ?? []) await persistLegacyAgentActivity(run.id, node.id, attempt.id, activity)
     const publicOutput = redactPublicText(result.output).value
     const changedFiles = writable ? (await runProcess('git', ['status', '--short'], run.worktreePath, 15_000)).split('\n').filter(Boolean) : []
@@ -750,7 +813,19 @@ async function executeValidation(run: RunSnapshot, node: RunNode, attempt: StepA
     appendEvent(run, 'command', `开始执行验证命令：${command.command}`, node.id, attempt.id, { command: command.command, cwd: command.cwd })
     await saveRun(run)
     output.push(`$ ${command.command}`)
-    output.push(await runShellCommand(command.command, join(run.worktreePath, command.cwd), command.timeoutMs, attempt.id, process => persistAttemptProcess(run.id, node.id, attempt.id, process)))
+    const result = await shellTool.execute({ command: command.command }, {
+      cwd: join(run.worktreePath, command.cwd),
+      workspaceRoot: run.worktreePath,
+      mode: 'workspace_write',
+      approved: true,
+      timeoutMs: command.timeoutMs,
+      attemptId: attempt.id,
+      processRegistry: activeProcesses,
+      onSpawn: process => persistAttemptProcess(run.id, node.id, attempt.id, process),
+    })
+    if (result.permission === 'deny') throw new Error(`验证命令被权限策略拒绝：${result.reason}`)
+    if (result.permission === 'approval_required') throw new Error(`验证命令需要审批：${result.reason}`)
+    output.push(result.stdout || result.stderr)
     appendEvent(run, 'command', `验证命令完成：${command.command}`, node.id, attempt.id, { command: command.command, cwd: command.cwd })
   }
   return reportPayload(`${commands.length} 个验证命令通过`, output.join('\n\n'))
@@ -797,6 +872,7 @@ async function prepareIntelligentRun(run: RunSnapshot): Promise<boolean> {
       requirement: run.input.text,
       attachments: textualAttachmentContext(run.input.attachments),
       repositoryMap: repositoryMap.content,
+      instructions: agentInstructionContext(repositoryMap.instructions),
       workflowId: run.workflow?.workflowId,
       workflowName: run.workflow?.workflowName,
       nodes: run.nodes.map(node => ({ id: node.id, kind: node.kind, prompt: node.prompt })),
@@ -860,6 +936,7 @@ async function writeArtifact(run: RunSnapshot, node: RunNode, payload: Record<st
 
 async function saveArtifactManifest(run: RunSnapshot, artifact: RunArtifact): Promise<void> { await atomicWrite(join(dirname(join(runDirectory(run.id), artifact.path)), 'manifest.json'), JSON.stringify(artifact, null, 2)) }
 function normalizeRun(run: RunSnapshot): RunSnapshot {
+  run.revision = Number.isSafeInteger(run.revision) && (run.revision ?? 0) >= 0 ? run.revision : 0
   run.project.environment.commandAllowlist ??= {}
   run.autoRepairCount ??= 0
   run.interactions = Array.isArray(run.interactions) ? run.interactions.filter(item => item && typeof item.id === 'string').map(item => ({ ...item, required: item.required !== false, status: item.status ?? 'pending', source: item.source ?? 'operator', kind: item.kind ?? 'text', title: item.title ?? '需要用户响应', question: item.question ?? '' })) : []
@@ -1139,6 +1216,22 @@ function isProcessAlive(pid: number): boolean {
   if (!Number.isSafeInteger(pid) || pid < 1) return false
   try { process.kill(pid, 0); return true } catch { return false }
 }
+function terminateRecordedProcess(pid: number | undefined): boolean {
+  if (!pid || !Number.isSafeInteger(pid) || pid < 1 || pid === process.pid) return false
+  try {
+    if (process.platform !== 'win32') process.kill(-pid, 'SIGTERM')
+    else process.kill(pid, 'SIGTERM')
+    // A detached executor may ignore SIGTERM; force-stop it before a new
+    // Attempt is created so two threads cannot mutate the same Worktree.
+    if (isProcessAlive(pid)) {
+      if (process.platform !== 'win32') process.kill(-pid, 'SIGKILL')
+      else process.kill(pid, 'SIGKILL')
+    }
+    return true
+  } catch {
+    try { process.kill(pid, 'SIGKILL'); return true } catch { return false }
+  }
+}
 function classifyFailure(message: string): RunFailureCategory {
   if (/timed out|timeout|etimedout/i.test(message)) return 'timeout'
   if (/TS\d{4}|cannot find module|module or type declarations|syntaxerror|type error|vite\s+build|compilation failed|build failed/i.test(message)) return 'compilation'
@@ -1167,8 +1260,27 @@ function appendLog(run: RunSnapshot, message: string): void { appendEvent(run, '
 function isTerminal(status: RunStatus): boolean { return status === 'succeeded' || status === 'failed' || status === 'cancelled' }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error) }
 async function saveRun(run: RunSnapshot): Promise<void> {
-  await atomicWrite(manifestPath(run.id), JSON.stringify(run, null, 2))
-  notifyRunChanged(run.id)
+  // Serialize manifest writes per run. Trace callbacks, process metadata callbacks,
+  // and the main state machine can all persist concurrently.
+  const expectedRevision = Number.isSafeInteger(run.revision) && (run.revision ?? 0) >= 0 ? run.revision! : 0
+  const previous = pendingRunWrites.get(run.id) ?? Promise.resolve()
+  const next = previous.catch(() => undefined).then(async () => {
+    let currentRevision = 0
+    try {
+      const current = JSON.parse(await readFile(manifestPath(run.id), 'utf8')) as { revision?: unknown }
+      if (Number.isSafeInteger(current.revision) && (current.revision as number) >= 0) currentRevision = current.revision as number
+    } catch { /* The first save creates the manifest. */ }
+    // Never allow an older in-memory snapshot to roll back a newer persisted one.
+    if (currentRevision !== expectedRevision) return
+    const revision = currentRevision + 1
+    await atomicWrite(manifestPath(run.id), JSON.stringify({ ...run, revision }, null, 2))
+    run.revision = revision
+    notifyRunChanged(run.id)
+  })
+  pendingRunWrites.set(run.id, next)
+  try { await next } finally {
+    if (pendingRunWrites.get(run.id) === next) pendingRunWrites.delete(run.id)
+  }
 }
 async function atomicWrite(path: string, content: string): Promise<void> { await mkdir(dirname(path), { recursive: true }); const temporary = `${path}.${randomUUID()}.tmp`; await writeFile(temporary, content, 'utf8'); await rename(temporary, path) }
 
@@ -1639,10 +1751,9 @@ function parseClaudeResult(stdout: string): string | undefined {
   }
   return stdout.trim() || undefined
 }
-async function runShellCommand(command: string, cwd: string, timeoutMs: number, attemptId: string, onSpawn?: RunProcessOptions['onSpawn']): Promise<string> { return runProcess('/bin/zsh', ['-lc', command], cwd, timeoutMs, attemptId, { onSpawn }) }
 async function runProcess(command: string, args: string[], cwd: string, timeoutMs: number, attemptId?: string, options: RunProcessOptions = {}): Promise<string> {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, env: options.env ?? process.env, stdio: [options.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] }); if (attemptId) activeProcesses.set(attemptId, child)
+    const child = spawn(command, args, { cwd, env: options.env ?? process.env, detached: process.platform !== 'win32', stdio: [options.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] }); if (attemptId) activeProcesses.set(attemptId, child)
     const spawnCallback = child.pid && options.onSpawn ? Promise.resolve(options.onSpawn({ pid: child.pid, commandHash: hash(JSON.stringify({ command, args, cwd })), startedAt: new Date().toISOString() })) : Promise.resolve()
     child.stdout!.setEncoding('utf8')
     child.stderr!.setEncoding('utf8')
@@ -1673,8 +1784,8 @@ async function runProcess(command: string, args: string[], cwd: string, timeoutM
     const settleAfterCallbacks = (handler: () => void) => { void Promise.all([drainCallbacks(), spawnCallback]).then(() => finish(() => callbackError ? reject(callbackError) : handler()), error => finish(() => reject(error))) }
     const timer = setTimeout(() => {
       timedOut = true
-      child.kill('SIGTERM')
-      forceKillTimer = setTimeout(() => { if (!settled) child.kill('SIGKILL') }, 5_000)
+      terminateProcess(child, 'SIGTERM')
+      forceKillTimer = setTimeout(() => { if (!settled) terminateProcess(child, 'SIGKILL') }, 5_000)
     }, timeoutMs)
     child.on('error', error => settleAfterCallbacks(() => reject(error)))
     child.on('close', (code, signal) => settleAfterCallbacks(() => {
@@ -1688,4 +1799,14 @@ async function runProcess(command: string, args: string[], cwd: string, timeoutM
       child.stdin.end(options.stdin, 'utf8')
     }
   })
+}
+
+function terminateProcess(child: ChildProcess | undefined, signal: NodeJS.Signals): void {
+  if (!child?.pid) return
+  try {
+    if (process.platform !== 'win32') process.kill(-child.pid, signal)
+    else child.kill(signal)
+  } catch {
+    try { child.kill(signal) } catch { /* The process may already have exited. */ }
+  }
 }

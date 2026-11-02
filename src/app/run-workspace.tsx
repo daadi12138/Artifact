@@ -5,6 +5,10 @@ import { AlertTriangle, ArrowDown, ArrowLeft, Check, CirclePause, CirclePlay, Cl
 import { readPreference, removePreference, writePreference } from './preferences'
 import { defaultRunMetricColumnWeights, minimumRunMetricColumnWidths, normalizeRunMetricColumnWeights, parseRunMetricColumnWeights, resizeRunMetricColumnPair, serializeRunMetricColumnWeights, type RunMetricColumnValues } from './run-metric-layout'
 import type { WorkflowRecordView } from './workflow-library'
+import { buildRunTimeline, runGroup } from './run-workspace-model'
+import { RunFlowMap } from './run-flow-map'
+import { RunChangesPanel } from './run-changes-panel'
+import { TerminalWorkbench } from './workbench'
 
 type CommandSpec = { command: string; cwd: string; timeoutMs: number }
 type PendingCommandApproval = { nodeId: string; commandKey: string; command: CommandSpec; requestedAt: string }
@@ -18,7 +22,7 @@ type AgentTraceKind = 'reasoning_summary' | 'agent_message' | 'tool_started' | '
 type AgentTraceEvent = { schemaVersion?: 1; seq: number; occurredAt: string; executorId?: string; nodeId: string; attemptId: string; kind: AgentTraceKind; sourceEventId?: string; toolName?: string; content?: string; command?: string; status?: string; exitCode?: number; durationMs?: number; truncated?: boolean; redacted?: boolean }
 type RunAttempt = { id: string; attempt: number; executorId: string; status: string; startedAt: string; endedAt?: string; exitReason?: string; output?: string; inputArtifactIds?: string[]; promptSnapshot?: AgentPromptSnapshot; finalResponse?: string; finalResponseRedacted?: boolean; finalResponseTruncated?: boolean; trace?: AgentTraceEvent[]; traceOmittedCount?: number }
 type RunNode = { id: string; kind: string; executorId?: string; executionMode?: 'read_only' | 'workspace_write'; prompt?: string; outputType?: string; state: string; attempts: RunAttempt[] }
-type RunIntelligence = { status: string; currentStage: string; reviewReason?: string; intent?: { goal: string; taskType: string; confidence: number; missingInformation: string[]; recommendedWorkflowId?: string }; plan?: { objective: string; steps: Array<{ nodeId: string; objective: string; verification: string }>; guardrails: string[]; recovery: { maxValidationRepairs: number; preserveWorktree: boolean; requireHumanApproval: boolean } }; repositoryMap?: { fileCount: number; omittedFileCount: number } }
+type RunIntelligence = { status: string; currentStage: string; reviewReason?: string; intent?: { goal: string; taskType: string; confidence: number; missingInformation: string[]; recommendedWorkflowId?: string }; plan?: { objective: string; steps: Array<{ nodeId: string; objective: string; verification: string }>; guardrails: string[]; recovery: { maxValidationRepairs: number; preserveWorktree: boolean; requireHumanApproval: boolean } }; repositoryMap?: { fileCount: number; omittedFileCount: number; instructions?: Array<{ path: string; bytes: number }> } }
 type DeliveryChange = { operation: 'add' | 'modify' | 'delete' | 'rename'; path: string; previousPath?: string; classification: string; baseHash: string | null; worktreeHash: string | null; projectHash: string | null; conflicts: Array<{ path: string; reason: string }> }
 export type RunWorkspaceRun = { id: string; status: string; startedAt: string; endedAt?: string; workflowCompletedAt?: string; worktreePath?: string; branchName?: string; intelligence?: RunIntelligence; deliveryApproval?: { requestedAt: string; changedFiles: string[]; changes?: DeliveryChange[]; worktreePath: string; projectPath: string }; pendingCommandApproval?: PendingCommandApproval; interactions?: HumanInteractionRequest[]; workflow?: { workflowId: string; workflowName: string; revision: number; publishedAt: string }; input: { text: string; attachments: RunAttachment[]; submittedAt?: string }; nodes: RunNode[]; edges: Array<{ from: string; to: string }>; logs: string[]; events: RunEvent[]; artifacts: RunArtifact[]; lastFailure?: { nodeId: string; attemptId: string; category: string; message: string; repairExhausted?: boolean } }
 
@@ -29,7 +33,6 @@ type RunPanelResizeState = { kind: RunPanelResizeKind; pointerId: number; startP
 type RunPanelMaximums = { historyWidth: number; contextWidth: number; historyHeight: number }
 type RunMetricResizeState = { dividerIndex: number; pointerId: number; startX: number; startWidths: RunMetricColumnValues }
 type RunReviewTab = 'prompt' | 'trace' | 'result' | 'diff'
-type TimelineItem = { id: string; occurredAt: string; order: number; kind: AgentTraceKind | RunEvent['type']; label: string; title: string; toolName?: string; content?: string; command?: string; status?: string; exitCode?: number; durationMs?: number; truncated?: boolean; redacted?: boolean; details?: RunEvent['details'] }
 type LiveStatePayload = { status: string; startedAt?: string; endedAt?: string; pendingCommandApproval?: PendingCommandApproval | null; interactions?: HumanInteractionRequest[]; logs?: string[]; nodes?: Array<{ id: string; state: string; attempts?: Array<{ id: string; status: string; startedAt: string; endedAt?: string; exitReason?: string; output?: string; finalResponse?: string }> }> }
 type LiveTracePayload = { nodeId: string; attemptId: string; events: AgentTraceEvent[]; traceOmittedCount: number; full: boolean }
 
@@ -120,7 +123,9 @@ function applyLiveTrace(run: RunWorkspaceRun, payload: LiveTracePayload): RunWor
 
 function statusClass(status: string) {
   if (status === 'succeeded' || status === 'success') return 'success'
-  if (status === 'failed' || status === 'cancelled') return 'failed'
+  if (status === 'idle' || status === 'skipped') return 'idle'
+  if (status === 'valid') return 'success'
+  if (status === 'failed' || status === 'cancelled' || status === 'invalid' || status === 'rejected') return 'failed'
   if (status === 'paused' || status === 'awaiting_input' || status === 'awaiting_approval' || status === 'awaiting_delivery' || status === 'waiting') return 'waiting'
   return 'running'
 }
@@ -160,6 +165,8 @@ function DeliveryApprovalSummary({ delivery }: { delivery: NonNullable<RunWorksp
 function HumanInteractionBanner({ interaction, busy, onAnswer }: { interaction: HumanInteractionRequest; busy: boolean; onAnswer: (answer: unknown) => void }) {
   const [draft, setDraft] = useState('')
   useEffect(() => setDraft(''), [interaction.id])
+  const canAddGuidance = interaction.source === 'agent' || interaction.source === 'operator' || (interaction.source === 'intent' && interaction.kind === 'review')
+  const hasFreeformInput = interaction.kind === 'text' || interaction.kind === 'form' || canAddGuidance
   const submit = () => onAnswer(draft.trim())
   const icon = interaction.kind === 'permission' ? <ShieldAlert aria-hidden="true" /> : <MessageCircleQuestion aria-hidden="true" />
   return <section className={`human-interaction-banner ${interaction.kind}`} role="alert">
@@ -172,10 +179,10 @@ function HumanInteractionBanner({ interaction, busy, onAnswer }: { interaction: 
       {interaction.context?.cwd && <small className="human-interaction-meta">cwd: {interaction.context.cwd}</small>}
       {interaction.context?.risk && <small className={`human-interaction-risk ${interaction.context.risk}`}>风险：{interaction.context.risk === 'high' ? '高' : interaction.context.risk === 'medium' ? '中' : '低'}</small>}
       {interaction.context?.files?.length ? <div className="human-interaction-files">{interaction.context.files.slice(0, 12).map(file => <code key={file}>{file}</code>)}{interaction.context.files.length > 12 && <small>还有 {interaction.context.files.length - 12} 个文件…</small>}</div> : null}
-      {(interaction.kind === 'text' || interaction.kind === 'form') && <textarea value={draft} onChange={event => setDraft(event.target.value)} placeholder="填写你的回答…" maxLength={16000} aria-label="填写交互响应" />}
+      {hasFreeformInput && <textarea value={draft} onChange={event => setDraft(event.target.value)} placeholder={canAddGuidance ? '可补充调整方向、约束或验收标准…' : '填写你的回答…'} maxLength={16000} aria-label="填写交互响应" />}
     </div>
     <div className="human-interaction-actions">
-      {interaction.options?.length ? interaction.options.map(option => <button key={option.id} className={option.id === 'reject' ? 'reject-btn' : option.id === 'approve' ? 'approve-btn' : 'ghost-btn'} disabled={busy} onClick={() => onAnswer(option.id === 'approve' ? { decision: 'approve' } : option.id === 'reject' ? { decision: 'reject' } : { optionId: option.id })}>{option.label}</button>) : interaction.kind === 'text' || interaction.kind === 'form' ? <><button className="reject-btn" disabled={busy} onClick={() => onAnswer({ decision: 'reject' })}>取消运行</button><button className="approve-btn" disabled={busy || !draft.trim()} onClick={submit}>提交并继续</button></> : <><button className="reject-btn" disabled={busy} onClick={() => onAnswer({ decision: 'reject' })}>拒绝</button><button className="approve-btn" disabled={busy} onClick={() => onAnswer({ decision: 'approve' })}>确认并继续</button></>}
+      {interaction.options?.length ? <>{interaction.options.map(option => <button key={option.id} className={option.id === 'reject' ? 'reject-btn' : option.id === 'approve' ? 'approve-btn' : 'ghost-btn'} disabled={busy} onClick={() => onAnswer(option.id === 'approve' ? { decision: 'approve' } : option.id === 'reject' ? { decision: 'reject' } : { optionId: option.id })}>{option.label}</button>)}{canAddGuidance && <button className="approve-btn" disabled={busy || !draft.trim()} onClick={submit}>提交说明并继续</button>}</> : hasFreeformInput ? <><button className="reject-btn" disabled={busy} onClick={() => onAnswer({ decision: 'reject' })}>取消运行</button><button className="approve-btn" disabled={busy || !draft.trim()} onClick={submit}>提交并继续</button></> : <><button className="reject-btn" disabled={busy} onClick={() => onAnswer({ decision: 'reject' })}>拒绝</button><button className="approve-btn" disabled={busy} onClick={() => onAnswer({ decision: 'approve' })}>确认并继续</button></>}
     </div>
   </section>
 }
@@ -195,16 +202,28 @@ async function fileToAttachment(file: File, index: number): Promise<AttachmentDr
 }
 
 function RunHistoryRail({ runs, selectedRunId, onSelect, className = '', children, panelId, listId, panelRef, listRef, style, listStyle }: { runs: RunWorkspaceRun[]; selectedRunId: string | null | undefined; onSelect: (id: string) => void; className?: string; children?: ReactNode; panelId?: string; listId?: string; panelRef?: Ref<HTMLElement>; listRef?: Ref<HTMLDivElement>; style?: CSSProperties; listStyle?: CSSProperties }) {
+  const [query, setQuery] = useState('')
+  const activeRuns = runs.filter(run => runGroup(run.status) === 'active')
+  const groups = [
+    { id: 'active', label: '正在运行', runs: activeRuns },
+    { id: 'attention', label: '需要处理', runs: runs.filter(run => runGroup(run.status) === 'attention') },
+    { id: 'history', label: '历史任务', runs: runs.filter(run => runGroup(run.status) === 'history') },
+  ]
+  const matches = (run: RunWorkspaceRun) => `${run.id} ${run.input.text} ${run.workflow?.workflowName ?? ''} ${run.branchName ?? ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())
   return <aside id={panelId} ref={panelRef} style={style} className={`run-history-rail ${className}`.trim()}>
-    <header className="run-history-heading"><div><span className="section-kicker">RUN HISTORY</span><h2>最近运行</h2></div><span className="run-history-total" title={`${runs.length} 条运行记录`}>{runs.length}</span></header>
-    {runs.length ? <div id={listId} ref={listRef} style={listStyle} className="recent-run-list">{runs.map(run => {
-      const status = statusClass(run.status)
-      const workflowName = run.workflow?.workflowName ?? '未命名工作流'
-      const branchName = run.branchName ?? '尚未创建分支'
-      const duration = formatDuration(run.startedAt, run.endedAt)
-      const artifactCount = run.artifacts.length
-      return <button key={run.id} className={`recent-run ${run.id === selectedRunId ? 'selected' : ''}`} aria-current={run.id === selectedRunId ? 'page' : undefined} aria-label={`查看运行 ${run.id}，${runStatusLabel(run.status)}，分支 ${branchName}，时长 ${duration}，${artifactCount} 个产物`} onClick={() => onSelect(run.id)}><span className="recent-run-track" aria-hidden="true"><span className={`recent-run-dot ${status}`} /></span><span className="recent-run-content"><span className="recent-run-header"><b title={workflowName}>{workflowName}</b><span className={`recent-run-status ${status}`} title={runStatusLabel(run.status)}><i aria-hidden="true" />{runStatusLabel(run.status)}</span></span><code className="recent-run-id" title={run.id}>{shortId(run.id)}</code><span className="recent-run-meta"><span className="recent-run-branch" title={branchName}><GitBranch aria-hidden="true" /><span>{branchName}</span></span><span title={`运行时长 ${duration}`}><Clock3 aria-hidden="true" />{duration}</span><span title={`${artifactCount} 个 Artifact`}><Package aria-hidden="true" />{artifactCount}</span></span></span></button>
-    })}</div> : <p className="run-history-empty">运行后，这里会按时间保留可回看的历史记录。</p>}
+    <header className="run-history-heading"><div><span className="section-kicker">WORKSPACE</span><h2>任务会话</h2></div><span className="run-history-total" title={`${runs.length} 条运行记录`}>{runs.length}</span></header>
+    <div className="run-history-summary"><span><i className="active" />运行 <b>{activeRuns.length}</b></span><span title="同时准备或执行的独立 Run"><i className="parallel" />并发 Run <b>{activeRuns.length > 1 ? activeRuns.length : 0}</b></span><span><i className="history" />待处理 <b>{groups[1].runs.length}</b></span></div>
+    <label className="run-history-search"><Search aria-hidden="true" /><input type="search" aria-label="搜索任务会话" placeholder="搜索需求、Run 或分支" value={query} onChange={event => setQuery(event.target.value)} /></label>
+    <div id={listId} ref={listRef} style={listStyle} className="recent-run-list">{groups.map(group => {
+      const visible = group.runs.filter(matches)
+      return visible.length ? <section className="run-history-group" key={group.id}><h3>{group.label}<span>{visible.length}</span></h3>{visible.map(run => {
+        const status = statusClass(run.status)
+        const title = run.input.text.trim().split('\n')[0] || run.workflow?.workflowName || '任务'
+        const branchName = run.branchName ?? '尚未创建分支'
+        const duration = formatDuration(run.startedAt, run.endedAt)
+        return <button key={run.id} className={`recent-run ${run.id === selectedRunId ? 'selected' : ''}`} aria-current={run.id === selectedRunId ? 'page' : undefined} aria-label={`${title}，${runStatusLabel(run.status)}`} onClick={() => onSelect(run.id)}><span className="recent-run-track" aria-hidden="true"><span className={`recent-run-dot ${status}`} /></span><span className="recent-run-content"><span className="recent-run-header"><b title={title}>{title}</b><span className={`recent-run-status ${status}`}><i aria-hidden="true" />{runStatusLabel(run.status)}</span></span><code className="recent-run-id" title={run.id}>{shortId(run.id)} · {run.workflow?.workflowName ?? '任务模板'}</code><span className="recent-run-meta"><span className="recent-run-branch" title={branchName}><GitBranch aria-hidden="true" /><span>{branchName}</span></span><span><Clock3 aria-hidden="true" />{duration}</span><span><Package aria-hidden="true" />{run.artifacts.length}</span></span></span></button>
+      })}</section> : null
+    })}{!runs.some(matches) && <p className="run-history-empty">{runs.length ? '没有匹配的任务。' : '开始任务后，这里会保留会话与执行记录。'}</p>}</div>
     {children}
   </aside>
 }
@@ -377,9 +396,12 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   const [text, setText] = useState('')
   const [attachments, setAttachments] = useState<AttachmentDraft[]>([])
   const [referenceUrl, setReferenceUrl] = useState('')
+  const referenceCompositionEndedAt = useRef(0)
   const [selectedNodeId, setSelectedNodeId] = useState('')
   const [selectedAttemptId, setSelectedAttemptId] = useState('')
-  const [tab, setTab] = useState<RunReviewTab>('prompt')
+  const [tab, setTab] = useState<RunReviewTab>('trace')
+  const [timelineNodeId, setTimelineNodeId] = useState('')
+  const [dockTab, setDockTab] = useState<'terminal' | 'diff' | 'review' | 'logs'>('logs')
   const [artifactPayload, setArtifactPayload] = useState<{ id: string; payload: unknown } | null>(null)
   const [steeringNote, setSteeringNote] = useState('')
   const [notice, setNotice] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
@@ -613,12 +635,9 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   useEffect(() => { if (selectedRun && !selectedRun.nodes.some(node => node.id === selectedNodeId)) setSelectedNodeId(selectedRun.nodes[0]?.id ?? '') }, [selectedNodeId, selectedRun])
   useEffect(() => {
     setArtifactPayload(null); setSelectedAttemptId(''); setTraceFollow(true)
-    // Running attempts open on the live trace; finished ones open on the result.
-    const run = runsRef.current.find(item => item.id === selectedRunId)
-    const node = run?.nodes.find(item => item.id === selectedNodeId) ?? run?.nodes[0]
-    const attempt = node?.attempts.at(-1)
-    setTab(attempt?.status === 'running' ? 'trace' : attempt?.status === 'succeeded' || attempt?.status === 'failed' ? 'result' : 'prompt')
+    setTab('trace')
   }, [selectedNodeId, selectedRunId])
+  useEffect(() => { setTimelineNodeId('') }, [selectedRunId])
   useEffect(() => { setLogQuery('') }, [selectedRunId])
   useEffect(() => { onRunContextChange?.(selectedRunContext) }, [onRunContextChange, selectedRunContext])
   useEffect(() => () => { onRunContextChange?.(null) }, [onRunContextChange])
@@ -709,7 +728,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
     } finally { setBusy(null) }
   }
 
-  const runAction = async (action: 'approve' | 'reject' | 'cancel' | 'pause' | 'resume' | 'retry' | 'steer' | 'request_delivery', extra: Record<string, string> = {}) => {
+  const runAction = async (action: 'approve' | 'reject' | 'cancel' | 'pause' | 'resume' | 'retry' | 'steer' | 'request_delivery' | 'restore_deleted', extra: Record<string, string> = {}) => {
     if (!selectedRun) return
     setBusy(action)
     setNotice(null)
@@ -723,6 +742,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
       if (action === 'resume') setNotice({ kind: 'success', text: '运行已恢复，将从暂停节点创建新的 Attempt。' })
       if (action === 'retry') setNotice({ kind: 'success', text: '已从所选节点重新运行，该节点及后续节点将创建新的 Attempt。' })
       if (action === 'request_delivery') setNotice({ kind: 'success', text: '交付已准备好，请核对文件后批准应用到项目目录。' })
+      if (action === 'restore_deleted') setNotice({ kind: 'success', text: '已恢复被删除的目标文件，请点击“重新检查”。' })
     } catch (error) {
       setNotice({ kind: 'error', text: error instanceof Error ? error.message : '操作没有完成。' })
     } finally { setBusy(null) }
@@ -759,7 +779,9 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
   const showWorktree = async () => { if (selectedRun?.worktreePath) await window.artifactDesktop?.showItem(selectedRun.worktreePath) }
   const selectedAttempt = useMemo(() => selectedNode?.attempts.find(attempt => attempt.id === selectedAttemptId) ?? selectedNode?.attempts.at(-1) ?? null, [selectedAttemptId, selectedNode])
   const selectedArtifacts = useMemo(() => selectedRun && selectedNode ? selectedRun.artifacts.filter(artifact => artifact.nodeId === selectedNode.id && (!artifact.attemptId || artifact.attemptId === selectedAttempt?.id)) : [], [selectedAttempt?.id, selectedNode, selectedRun])
-  const selectedTimeline = useMemo(() => buildAttemptTimeline(selectedRun, selectedNode, selectedAttempt), [selectedAttempt, selectedNode, selectedRun])
+  const workspaceTimeline = useMemo(() => buildRunTimeline(selectedRun), [selectedRun])
+  const visibleTimeline = useMemo(() => workspaceTimeline.filter(item => !timelineNodeId || item.nodeId === timelineNodeId), [workspaceTimeline, timelineNodeId])
+  const openDock = (next: typeof dockTab) => { setDockTab(next); setLogPanelVisible(true); writePreference('artifact.run-workspace.log-panel-visible', 'true') }
   const selectedDiff = useMemo(() => selectedArtifacts.filter(artifact => artifact.type === 'code-diff').at(-1) ?? null, [selectedArtifacts])
   const latestResultArtifact = useMemo(() => selectedArtifacts.filter(artifact => artifact.type !== 'code-diff').at(-1) ?? null, [selectedArtifacts])
   const openedArtifact = useMemo(() => selectedArtifacts.find(artifact => artifact.id === artifactPayload?.id) ?? null, [artifactPayload?.id, selectedArtifacts])
@@ -838,7 +860,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
     if (tab !== 'trace' || !traceFollow) return
     const element = traceListRef.current
     if (element) element.scrollTop = element.scrollHeight
-  }, [selectedTimeline.length, tab, traceFollow])
+  }, [workspaceTimeline.length, tab, traceFollow])
 
   const handleTraceScroll = () => {
     const element = traceListRef.current
@@ -873,8 +895,8 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
 
   return <section className="run-workspace">
     <header className="run-workspace-header">
-      <div className="run-workspace-title"><span className="section-kicker">RUN WORKSPACE</span><h1>{selectedRun ? selectedRun.workflow?.workflowName ?? '历史运行' : '运行工作流'}</h1><p>{selectedRun ? <><span className="mono" title={selectedRun.id}>运行 {shortId(selectedRun.id)}</span> · {new Date(selectedRun.startedAt).toLocaleString('zh-CN')}</> : '选择已发布版本，提交需求，然后在独立 Worktree 中查看每一步。'}</p></div>
-      {selectedRun && <div className="run-workspace-header-actions"><button className={`ghost-btn run-log-panel-button ${logPanelVisible ? 'active' : ''}`} title={logPanelVisible ? '关闭运行日志终端' : '打开运行日志终端'} aria-label={logPanelVisible ? '关闭运行日志终端' : '打开运行日志终端'} aria-pressed={logPanelVisible} onClick={toggleLogPanel}><PanelBottom aria-hidden="true" />日志</button><button className="ghost-btn" onClick={() => setSelectedRunId(null)}><ArrowLeft aria-hidden="true" />新建运行</button></div>}
+      <div className="run-workspace-title"><span className="section-kicker">RUN WORKSPACE</span><h1>{selectedRun ? selectedRun.input.text.trim().split('\n')[0]?.slice(0, 56) || selectedRun.workflow?.workflowName || '任务会话' : '开始新任务'}</h1><p>{selectedRun ? <><span className="mono" title={selectedRun.id}>运行 {shortId(selectedRun.id)}</span> · {new Date(selectedRun.startedAt).toLocaleString('zh-CN')}</> : '描述目标，在独立 Worktree 中执行，并在这里检查过程和结果。'}</p></div>
+      {selectedRun && <div className="run-workspace-header-actions"><button className={`ghost-btn run-log-panel-button ${logPanelVisible ? 'active' : ''}`} title={logPanelVisible ? '收起工具面板' : '打开工具面板'} aria-label={logPanelVisible ? '收起工具面板' : '打开工具面板'} aria-pressed={logPanelVisible} onClick={toggleLogPanel}><PanelBottom aria-hidden="true" />工具面板</button><button className="ghost-btn" onClick={() => setSelectedRunId(null)}><ArrowLeft aria-hidden="true" />新建运行</button></div>}
     </header>
 
     {notice && <div className={`run-notice ${notice.kind}`} role="status">{notice.kind === 'error' ? <AlertTriangle aria-hidden="true" /> : <Check aria-hidden="true" />}<span>{notice.text}</span><button aria-label="关闭提示" onClick={() => setNotice(null)}><X aria-hidden="true" /></button></div>}
@@ -882,16 +904,18 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
     {!selectedRun ? <div className="run-launcher">
       <RunHistoryRail runs={runs} selectedRunId={selectedRunId} onSelect={setSelectedRunId} />
       <section className="run-launch-main">
-        <div className="launcher-step"><span>01</span><div><h2>选择发布版本</h2><p>草稿不可运行。每次运行固定使用发布时的节点、连线和指令。</p></div></div>
+        <div className="launcher-step"><span>01</span><div><h2>你想完成什么？</h2><p>描述需求、附上参考资料，然后开始任务。</p></div></div>
+        <label className="run-requirement-label">需求<textarea value={text} onChange={event => setText(event.target.value)} placeholder="说明目标、范围、验收标准和已有约束…" maxLength={40000} /></label>
+        <div className="run-attachment-tools"><button className="attachment-add" disabled={busy === 'attachments'} onClick={() => attachmentInputRef.current?.click()}><ImagePlus aria-hidden="true" />添加文件</button><div className="reference-input"><input value={referenceUrl} onChange={event => setReferenceUrl(event.target.value)} onCompositionEnd={() => { referenceCompositionEndedAt.current = performance.now() }} onKeyDown={event => { if (event.key !== 'Enter') return; if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (performance.now() - referenceCompositionEndedAt.current < 500) { event.preventDefault(); referenceCompositionEndedAt.current = 0; return } event.preventDefault(); attachReference() }} placeholder="粘贴网页参考地址" /><button className="header-icon-button" title="添加网页参考" aria-label="添加网页参考" onClick={attachReference}><Send aria-hidden="true" /></button></div><input ref={attachmentInputRef} type="file" multiple hidden onChange={event => { if (event.target.files) void addFiles(event.target.files); event.currentTarget.value = '' }} /></div>
+        {attachments.length > 0 && <div className="run-attachment-list">{attachments.map(attachment => <article key={attachment.id} className="run-attachment"><span>{attachment.preview ? <img src={attachment.preview} alt="" /> : attachment.sourceUrl ? <Waypoints aria-hidden="true" /> : <Paperclip aria-hidden="true" />}</span><div><b title={attachment.name}>{attachment.name}</b><small>{attachment.sourceUrl ? '网页参考' : `${attachment.mediaType} · ${formatBytes(attachment.byteLength)}`}</small></div><button aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments(current => current.filter(item => item.id !== attachment.id))}><X aria-hidden="true" /></button></article>)}</div>}
+        <details className="run-template-picker" open={!publishedWorkflows.length}>
+        <summary>任务模板 · {chosenWorkflow ? latestPublished(chosenWorkflow)?.definition.name : '选择模板'}</summary><p className="console-empty">模板固定此次任务的步骤与权限约束。需要定制时可在左侧“任务模板”中编辑并发布。</p>
         <div className="workflow-launch-list">{publishedWorkflows.length ? publishedWorkflows.map(workflow => {
           const published = latestPublished(workflow)!
           return <button className={`workflow-launch-option ${workflow.id === chosenWorkflow?.id ? 'selected' : ''}`} key={workflow.id} onClick={() => setWorkflowId(workflow.id)}><span className="workflow-launch-icon"><Waypoints aria-hidden="true" /></span><span><b>{published.definition.name}</b><small>v{published.revision} · 发布于 {new Date(published.publishedAt).toLocaleDateString('zh-CN')}</small></span><span className="workflow-launch-count">{published.definition.nodes.length} 节点</span></button>
-        }) : <div className="launcher-empty"><FileCode2 aria-hidden="true" /><div><b>还没有已发布的工作流</b><span>先在工作流库中创建模板并发布一个版本。</span></div>{workflows[0] && <button className="ghost-btn" onClick={() => onEditWorkflow(workflows[0])}>编辑草稿</button>}</div>}</div>
+        }) : <div className="launcher-empty"><FileCode2 aria-hidden="true" /><div><b>还没有可执行的任务模板</b><span>先在任务模板中创建并发布一个版本。</span></div>{workflows[0] && <button className="ghost-btn" onClick={() => onEditWorkflow(workflows[0])}>编辑草稿</button>}</div>}</div>
 
-        <div className="launcher-step"><span>02</span><div><h2>提交需求</h2><p>文字、文件和网页参考会被保存为此次运行的输入包。</p></div></div>
-        <label className="run-requirement-label">需求<textarea value={text} onChange={event => setText(event.target.value)} placeholder="说明目标、范围、验收标准和已有约束…" maxLength={40000} /></label>
-        <div className="run-attachment-tools"><button className="attachment-add" disabled={busy === 'attachments'} onClick={() => attachmentInputRef.current?.click()}><ImagePlus aria-hidden="true" />添加文件</button><div className="reference-input"><input value={referenceUrl} onChange={event => setReferenceUrl(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); attachReference() } }} placeholder="粘贴网页参考地址" /><button className="header-icon-button" title="添加网页参考" aria-label="添加网页参考" onClick={attachReference}><Send aria-hidden="true" /></button></div><input ref={attachmentInputRef} type="file" multiple hidden onChange={event => { if (event.target.files) void addFiles(event.target.files); event.currentTarget.value = '' }} /></div>
-        {attachments.length > 0 && <div className="run-attachment-list">{attachments.map(attachment => <article key={attachment.id} className="run-attachment"><span>{attachment.preview ? <img src={attachment.preview} alt="" /> : attachment.sourceUrl ? <Waypoints aria-hidden="true" /> : <Paperclip aria-hidden="true" />}</span><div><b title={attachment.name}>{attachment.name}</b><small>{attachment.sourceUrl ? '网页参考' : `${attachment.mediaType} · ${formatBytes(attachment.byteLength)}`}</small></div><button aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments(current => current.filter(item => item.id !== attachment.id))}><X aria-hidden="true" /></button></article>)}</div>}
+        </details>
         <footer className="run-launch-footer"><span>{attachments.length}/{maxAttachmentCount} 附件 · 总计 {formatBytes(attachments.reduce((sum, item) => sum + item.byteLength, 0))}</span><button className="run-btn run-launch-button" disabled={busy === 'start' || !publishedWorkflows.length} onClick={() => void startRun()}>{busy === 'start' ? <LoaderCircle className="spin" aria-hidden="true" /> : <Play aria-hidden="true" />}开始运行</button></footer>
       </section>
     </div> : <>
@@ -901,11 +925,11 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
         <div className="approval-banner-copy">
           <span className="section-kicker">{selectedRun.deliveryApproval ? 'DELIVERY APPROVAL REQUIRED' : 'HUMAN APPROVAL REQUIRED'}</span>
           <b>{selectedRun.deliveryApproval ? '确认将验证通过的结果应用到项目目录？' : selectedRun.intelligence?.status === 'awaiting_approval' ? '确认识别出的用户意图和执行计划？' : selectedRun.pendingCommandApproval ? '允许在隔离 Worktree 中执行此命令？' : '此运行正在等待人工审批。'}</b>
-          {selectedRun.deliveryApproval ? <DeliveryApprovalSummary delivery={selectedRun.deliveryApproval} /> : selectedRun.intelligence?.status === 'awaiting_approval' ? <><small>{selectedRun.intelligence.reviewReason}</small>{selectedRun.intelligence.intent?.missingInformation.map(question => <code key={question}>{question}</code>)}</> : selectedRun.pendingCommandApproval ? <><code title={selectedRun.pendingCommandApproval.command.command}>$ {selectedRun.pendingCommandApproval.command.command}</code><small><span title={selectedRun.pendingCommandApproval.command.cwd}>cwd: {selectedRun.pendingCommandApproval.command.cwd}</span> · timeout {Math.round(selectedRun.pendingCommandApproval.command.timeoutMs / 1000)}s</small></> : <small>确认当前节点的产物后继续流程。</small>}
+          {selectedRun.deliveryApproval ? <><DeliveryApprovalSummary delivery={selectedRun.deliveryApproval} />{selectedRun.deliveryApproval.changes?.some(change => change.conflicts.length) && <small className="delivery-conflict-help">检测到项目目录在运行期间发生变化，应用按钮已暂时禁用。若文件只是被误删，可点击“恢复被删除文件”；其他修改需要先在编辑器中手工合并。</small>}</> : selectedRun.intelligence?.status === 'awaiting_approval' ? <><small>{selectedRun.intelligence.reviewReason}</small>{selectedRun.intelligence.intent?.missingInformation.map(question => <code key={question}>{question}</code>)}</> : selectedRun.pendingCommandApproval ? <><code title={selectedRun.pendingCommandApproval.command.command}>$ {selectedRun.pendingCommandApproval.command.command}</code><small><span title={selectedRun.pendingCommandApproval.command.cwd}>cwd: {selectedRun.pendingCommandApproval.command.cwd}</span> · timeout {Math.round(selectedRun.pendingCommandApproval.command.timeoutMs / 1000)}s</small></> : <small>确认当前节点的产物后继续流程。</small>}
         </div>
         <div className="approval-banner-actions">
           <button className="reject-btn" disabled={Boolean(busy)} onClick={() => void runAction('reject')}>拒绝</button>
-          {selectedRun.deliveryApproval?.changes?.some(change => change.conflicts.length) && <button className="ghost-btn" disabled={Boolean(busy)} onClick={() => void runAction('request_delivery')}>重新检查</button>}
+          {selectedRun.deliveryApproval?.changes?.some(change => change.conflicts.length) && <>{selectedRun.deliveryApproval.changes.some(change => change.operation !== 'delete' && change.baseHash !== null && change.projectHash === null && change.conflicts.length > 0) && <button className="ghost-btn" disabled={Boolean(busy)} onClick={() => void runAction('restore_deleted')}>恢复被删除文件</button>}<button className="ghost-btn" disabled={Boolean(busy)} onClick={() => void runAction('request_delivery')}>重新检查</button></>}
           <button className="approve-btn" disabled={Boolean(busy) || Boolean(selectedRun.deliveryApproval?.changes?.some(change => change.conflicts.length))} onClick={() => void runAction('approve')}>{selectedRun.deliveryApproval ? '应用到项目' : '批准执行'}</button>
         </div>
       </section>}
@@ -919,17 +943,16 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
           <header className="run-console-main-heading">
             <div>
               <span className="section-kicker">{selectedNode?.kind ?? 'RUN'}</span>
-              <h2 title={selectedNode?.id}>{selectedNode?.id ?? '选择节点'}</h2>
+              <h2 title={selectedNode?.id}>{tab === 'trace' ? 'Agent 时间线' : selectedNode?.id ?? '选择节点'}</h2>
               <p title={publicNodeInstruction}>{publicNodeInstruction}</p>
               {selectedNode?.attempts.length ? <div className="run-attempt-row">
                 <label className="run-attempt-picker">
                   <span>Attempt</span>
                   <select aria-label="选择执行尝试" value={selectedAttempt?.id ?? ''} onChange={event => {
-                    const nextAttempt = selectedNode.attempts.find(attempt => attempt.id === event.target.value)
                     setSelectedAttemptId(event.target.value)
                     setArtifactPayload(null)
                     setTraceFollow(true)
-                    setTab(nextAttempt?.status === 'running' ? 'trace' : nextAttempt?.status === 'succeeded' || nextAttempt?.status === 'failed' ? 'result' : 'prompt')
+                    setTab('result')
                   }}>
                     {selectedNode.attempts.map(attempt => <option key={attempt.id} value={attempt.id}>Attempt {attempt.attempt} · {stateLabel(attempt.status)}</option>)}
                   </select>
@@ -939,7 +962,7 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
             </div>
             <div className="run-console-tabs" role="tablist" aria-label="运行审查视图">
               <button id="run-tab-prompt" role="tab" aria-selected={tab === 'prompt'} aria-controls="run-tabpanel" className={tab === 'prompt' ? 'active' : ''} onClick={() => setTab('prompt')}>发送内容</button>
-              <button id="run-tab-trace" role="tab" aria-selected={tab === 'trace'} aria-controls="run-tabpanel" className={tab === 'trace' ? 'active' : ''} onClick={() => setTab('trace')}>执行过程 <span>{selectedTimeline.length}</span></button>
+              <button id="run-tab-trace" role="tab" aria-selected={tab === 'trace'} aria-controls="run-tabpanel" className={tab === 'trace' ? 'active' : ''} onClick={() => setTab('trace')}>执行过程 <span>{workspaceTimeline.length}</span></button>
               <button id="run-tab-result" role="tab" aria-selected={tab === 'result'} aria-controls="run-tabpanel" className={tab === 'result' ? 'active' : ''} onClick={() => setTab('result')}>结果 <span>{selectedArtifacts.length}</span></button>
               <button id="run-tab-diff" role="tab" aria-selected={tab === 'diff'} aria-controls="run-tabpanel" className={tab === 'diff' ? 'active' : ''} onClick={() => setTab('diff')} disabled={!selectedDiff}>代码变更</button>
             </div>
@@ -963,11 +986,12 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
               <article><span>冻结附件</span>{selectedRun.input.attachments.length ? <div className="console-attachment-list">{selectedRun.input.attachments.map(attachment => <div key={attachment.id}><Paperclip aria-hidden="true" /><span title={attachment.name}>{attachment.name}</span><small>{attachment.sourceUrl ?? `${attachment.mediaType} · ${formatBytes(attachment.byteLength)}`}</small></div>)}</div> : <p>没有附件。</p>}</article>
             </div>}
             {tab === 'trace' && <div className="run-trace-wrap">
-              <div ref={traceListRef} onScroll={handleTraceScroll} className="run-event-list run-trace-list">{selectedAttempt?.traceOmittedCount ? <p className="trace-omitted-note">为控制回放体积，未展示较早的 {selectedAttempt.traceOmittedCount} 条记录。</p> : null}{selectedTimeline.length ? selectedTimeline.map(event => <article key={event.id} className={`run-event trace-event ${event.kind}`}>
+              <div className="run-timeline-scope"><label>范围 <select aria-label="时间线节点范围" value={timelineNodeId} onChange={event => setTimelineNodeId(event.target.value)}><option value="">整个任务</option>{selectedRun.nodes.map(node => <option key={node.id} value={node.id}>{node.id}</option>)}</select></label><span>{visibleTimeline.length} 条公开记录</span></div>
+              <div ref={traceListRef} onScroll={handleTraceScroll} className="run-event-list run-trace-list">{visibleTimeline.length ? visibleTimeline.map(event => <article key={event.id} className={`run-event trace-event ${event.kind}`}>
               <span className="event-time">{new Date(event.occurredAt).toLocaleTimeString('zh-CN', { hour12: false })}</span>
               <span className="event-type">{event.label}</span>
-              <div><b>{event.title}</b>{event.toolName && <code className="trace-tool-name">{event.toolName}</code>}{event.content && <p className="trace-event-content">{event.content}</p>}{event.command && <pre>$ {event.command}</pre>}{event.details && <pre>{Object.entries(event.details).map(([key, value]) => `${key}: ${String(value)}`).join('\n')}</pre>}{(event.status !== undefined || event.exitCode !== undefined || event.durationMs !== undefined || event.truncated || event.redacted) && <div className="trace-event-meta">{event.status !== undefined && <span>{event.status}</span>}{event.exitCode !== undefined && <span className={event.exitCode === 0 ? 'success' : 'failed'}>退出码 {event.exitCode}</span>}{event.durationMs !== undefined && <span>{formatTraceDuration(event.durationMs)}</span>}{event.redacted && <span>敏感信息已脱敏</span>}{event.truncated && <span>内容已截断</span>}</div>}</div>
-            </article>) : <p className="console-empty">该 Attempt 尚未产生可公开展示的执行记录。</p>}</div>
+              <div><b>{event.title}</b>{event.nodeId && <button className="timeline-node-link" onClick={() => { setSelectedNodeId(event.nodeId!); setTimelineNodeId(event.nodeId!) }}>{event.nodeId}</button>}{event.artifactId && <button className="timeline-node-link" onClick={() => { const artifact = selectedRun.artifacts.find(item => item.id === event.artifactId); if (artifact) { setSelectedNodeId(artifact.nodeId); void openArtifact(artifact) } }}>查看产物</button>}{event.toolName && <code className="trace-tool-name">{event.toolName}</code>}{event.content && <p className="trace-event-content">{event.content}</p>}{event.command && <pre>$ {event.command}</pre>}{event.details && <pre>{Object.entries(event.details).map(([key, value]) => `${key}: ${String(value)}`).join('\n')}</pre>}{(event.status !== undefined || event.exitCode !== undefined || event.durationMs !== undefined || event.truncated || event.redacted) && <div className="trace-event-meta">{event.status !== undefined && <span>{event.status}</span>}{event.exitCode !== undefined && <span className={event.exitCode === 0 ? 'success' : 'failed'}>退出码 {event.exitCode}</span>}{event.durationMs !== undefined && <span>{formatTraceDuration(event.durationMs)}</span>}{event.redacted && <span>敏感信息已脱敏</span>}{event.truncated && <span>内容已截断</span>}</div>}</div>
+            </article>) : <p className="console-empty">尚无匹配的公开执行记录。</p>}</div>
               {selectedAttempt?.status === 'running' && !traceFollow && <button className="trace-follow-button" onClick={jumpToLatestTrace}><ArrowDown aria-hidden="true" />回到最新</button>}
               {selectedAttempt?.status === 'running' && <span className={`trace-live-indicator ${liveConnected ? 'live' : ''}`}><i aria-hidden="true" />{liveConnected ? '实时' : '同步中'}</span>}
             </div>}
@@ -986,20 +1010,25 @@ export function RunWorkspace({ workflows, onEditWorkflow, onRunContextChange }: 
           </section>
         </main>
         <button className="run-panel-resizer run-panel-resizer-right" type="button" role="separator" aria-label="调整运行上下文栏宽度" aria-orientation="vertical" aria-controls="run-review-panel run-context-panel" aria-valuemin={minRunContextWidth} aria-valuemax={runPanelMaximums.contextWidth} aria-valuenow={Math.min(runContextWidth, runPanelMaximums.contextWidth)} title="拖动调整运行上下文栏；双击恢复默认" onPointerDown={event => startRunPanelResize('context-width', event)} onPointerMove={resizeRunPanel} onPointerUp={finishRunPanelResize} onPointerCancel={finishRunPanelResize} onLostPointerCapture={finishRunPanelResize} onKeyDown={event => adjustRunPanelSize('context-width', event)} onDoubleClick={() => commitRunPanelSize('context-width', defaultRunContextWidth)} />
-        <aside id="run-context-panel" ref={runContextPanelRef} className="run-context-panel"><section><span className="section-kicker">RUN CONTEXT</span><dl><div><dt>运行 ID</dt><dd><code title={selectedRun.id}>{selectedRun.id}</code></dd></div><div><dt>工作流版本</dt><dd title={selectedRun.workflow ? `${selectedRun.workflow.workflowName} v${selectedRun.workflow.revision}` : '历史运行'}>{selectedRun.workflow ? `${selectedRun.workflow.workflowName} v${selectedRun.workflow.revision}` : '历史运行'}</dd></div><div><dt>Worktree</dt><dd>{selectedRun.worktreePath ? <div className="context-path"><code title={selectedRun.worktreePath}>{selectedRun.worktreePath}</code><button className="path-button" title="在 Finder 中显示 Worktree" aria-label="在 Finder 中显示 Worktree" onClick={() => void showWorktree()}><FolderOpen aria-hidden="true" /></button></div> : '准备中'}</dd></div><div><dt>Branch</dt><dd><code title={selectedRun.branchName ?? '—'}>{selectedRun.branchName ?? '—'}</code></dd></div></dl></section>
+        <aside id="run-context-panel" ref={runContextPanelRef} className="run-context-panel"><section className="run-flow-section"><div className="run-context-section-heading"><div><span className="section-kicker">TASK FLOW</span><b>任务流程</b></div><span>{selectedRun.nodes.length} steps</span></div><RunFlowMap run={selectedRun} selectedId={selectedNode?.id} onSelect={id => { setSelectedNodeId(id); setTimelineNodeId(id); setTab('trace') }} /><p className="run-map-caption">依赖关系图 · 当前 Run 按依赖顺序执行</p></section>
+          <section className="run-tool-section"><span className="section-kicker">TOOLS</span><div className="run-tool-grid"><button className={logPanelVisible && dockTab === 'terminal' ? 'active' : ''} onClick={() => openDock('terminal')}><Terminal aria-hidden="true" />Terminal</button><button className={logPanelVisible && dockTab === 'diff' ? 'active' : ''} onClick={() => openDock('diff')}><FileCode2 aria-hidden="true" />Diff</button><button className={logPanelVisible && dockTab === 'review' ? 'active' : ''} onClick={() => openDock('review')}><Check aria-hidden="true" />Review</button></div></section>
+          <section><span className="section-kicker">RUN CONTEXT</span><dl><div><dt>运行 ID</dt><dd><code title={selectedRun.id}>{selectedRun.id}</code></dd></div><div><dt>工作流版本</dt><dd title={selectedRun.workflow ? `${selectedRun.workflow.workflowName} v${selectedRun.workflow.revision}` : '历史运行'}>{selectedRun.workflow ? `${selectedRun.workflow.workflowName} v${selectedRun.workflow.revision}` : '历史运行'}</dd></div><div><dt>Worktree</dt><dd>{selectedRun.worktreePath ? <div className="context-path"><code title={selectedRun.worktreePath}>{selectedRun.worktreePath}</code><button className="path-button" title="在 Finder 中显示 Worktree" aria-label="在 Finder 中显示 Worktree" onClick={() => void showWorktree()}><FolderOpen aria-hidden="true" /></button></div> : '准备中'}</dd></div><div><dt>Branch</dt><dd><code title={selectedRun.branchName ?? '—'}>{selectedRun.branchName ?? '—'}</code></dd></div></dl></section>
           {canRetrySelectedNode && <section className="run-retry-card"><b>节点未完成</b><p>{selectedNode?.id} 当前为“{stateLabel(selectedNode?.state ?? '')}”，可以从此节点重新运行。</p><button className="ghost-btn" disabled={Boolean(busy)} onClick={() => void runAction('retry', { nodeId: selectedNode!.id })}><RotateCcw aria-hidden="true" />从此节点重试</button></section>}
           {selectedRun.status === 'succeeded' && !selectedRun.deliveryApproval && selectedRun.worktreePath && <section className="run-retry-card"><b>交付结果</b><p>结果仍在隔离 Worktree 中。准备审批后可将文件应用到项目目录。</p><button className="ghost-btn" disabled={Boolean(busy)} onClick={() => void runAction('request_delivery')}><Package aria-hidden="true" />准备交付审批</button></section>}
-          {selectedRun.intelligence?.intent && <section className="run-intelligence-card"><span className="section-kicker">INTENT ROUTER</span><b>{selectedRun.intelligence.intent.taskType} · {Math.round(selectedRun.intelligence.intent.confidence * 100)}% 置信度</b><p>{selectedRun.intelligence.intent.goal}</p>{selectedRun.intelligence.intent.missingInformation.length > 0 && <small>待澄清：{selectedRun.intelligence.intent.missingInformation.join('；')}</small>}{selectedRun.intelligence.repositoryMap && <small>Repo map：{selectedRun.intelligence.repositoryMap.fileCount} 个文件{selectedRun.intelligence.repositoryMap.omittedFileCount ? `，省略 ${selectedRun.intelligence.repositoryMap.omittedFileCount} 个` : ''}</small>}</section>}
+          {selectedRun.intelligence?.intent && <section className="run-intelligence-card"><span className="section-kicker">INTENT ROUTER</span><b>{selectedRun.intelligence.intent.taskType} · {Math.round(selectedRun.intelligence.intent.confidence * 100)}% 置信度</b><p>{selectedRun.intelligence.intent.goal}</p>{selectedRun.intelligence.intent.missingInformation.length > 0 && <small>待澄清：{selectedRun.intelligence.intent.missingInformation.join('；')}</small>}{selectedRun.intelligence.repositoryMap && <><small>Repo map：{selectedRun.intelligence.repositoryMap.fileCount} 个文件{selectedRun.intelligence.repositoryMap.omittedFileCount ? `，省略 ${selectedRun.intelligence.repositoryMap.omittedFileCount} 个` : ''}</small>{selectedRun.intelligence.repositoryMap.instructions?.length ? <small>项目规则：{selectedRun.intelligence.repositoryMap.instructions.map(item => item.path).join('、')}</small> : <small>项目规则：未发现 AGENTS.md</small>}</>}</section>}
           {selectedRun.intelligence?.plan && <section className="run-plan-card"><span className="section-kicker">EXECUTION PLAN</span><b>{selectedRun.intelligence.plan.objective}</b><ol>{selectedRun.intelligence.plan.steps.map(step => <li key={step.nodeId}><span>{step.nodeId}</span><small>{step.objective}</small></li>)}</ol></section>}
           {selectedRun.status === 'paused' && <section className="run-steering-card"><span className="section-kicker">STEER NEXT ATTEMPT</span><b>补充方向</b><textarea value={steeringNote} onChange={event => setSteeringNote(event.target.value)} placeholder="说明新的约束、优先级或希望 Agent 调整的方向…" maxLength={16000} /><div><button className="ghost-btn" disabled={!steeringNote.trim() || Boolean(busy)} onClick={() => void runAction('steer', { nodeId: selectedNode?.id ?? '', note: steeringNote })}>保存说明</button><button className="run-btn" disabled={Boolean(busy)} onClick={() => void runAction('resume')}>继续执行</button></div></section>}
           {selectedRun.lastFailure && <section className="run-failure-card"><span className="section-kicker">LAST FAILURE</span><b>{failureCategoryLabel(selectedRun.lastFailure.category)}</b><p>{selectedRun.lastFailure.message}</p>{selectedRun.lastFailure.repairExhausted && <small>自动修复已尝试两轮，保留 Worktree 供人工决定下一步。</small>}</section>}
         </aside>
       </div>
-      {logPanelVisible && <section className={`run-bottom-log-panel ${logPanelResizing ? 'resizing' : ''}`} style={{ '--run-log-height': `${logPanelHeight}px` } as CSSProperties} aria-label="运行日志终端">
+      <section hidden={!logPanelVisible} className={`run-bottom-log-panel ${logPanelResizing ? 'resizing' : ''}`} style={{ '--run-log-height': `${logPanelHeight}px` } as CSSProperties} aria-label="任务工具面板">
         <button className="run-log-splitter" type="button" role="separator" aria-label="调整运行日志终端高度" aria-orientation="horizontal" aria-controls="run-log-content" aria-valuemin={minRunLogHeight} aria-valuemax={maxRunLogHeight} aria-valuenow={logPanelHeight} title="拖动调整日志终端高度；双击恢复默认" onPointerDown={startLogPanelResize} onPointerMove={resizeLogPanel} onPointerUp={finishLogPanelResize} onPointerCancel={finishLogPanelResize} onLostPointerCapture={finishLogPanelResize} onKeyDown={adjustLogPanelHeight} onDoubleClick={() => { logPanelHeightRef.current = defaultRunLogHeight; setLogPanelHeight(defaultRunLogHeight); writePreference('artifact.run-workspace.log-panel-height', String(defaultRunLogHeight)) }} />
-        <div className="run-bottom-log-heading"><div className="run-bottom-log-title"><Terminal aria-hidden="true" /><span>运行日志</span><span className="run-log-count">{logQuery ? `${filteredLogs.length}/${selectedRun.logs.length}` : `${selectedRun.logs.length}`} 行</span></div><div className="run-log-actions"><label className="run-log-filter"><Search aria-hidden="true" /><input type="search" value={logQuery} onChange={event => setLogQuery(event.target.value)} placeholder="过滤日志" aria-label="过滤运行日志" />{logQuery && <button type="button" title="清除日志过滤" aria-label="清除日志过滤" onClick={() => setLogQuery('')}><X aria-hidden="true" /></button>}</label><button className="run-copy-button" title="复制当前日志" aria-label="复制当前日志" onClick={() => void copyText(filteredLogs.join('\n'), 'log')}>{copiedKey === 'log' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button><button className="run-log-close" type="button" title="关闭运行日志终端" aria-label="关闭运行日志终端" onClick={toggleLogPanel}><X aria-hidden="true" /></button></div></div>
-        <div id="run-log-content" ref={logContentRef} className="run-bottom-log-content"><div className="run-log-summary">{filteredLogs.length > visibleLogs.length && <span>显示最近 {visibleLogs.length} 行</span>}</div><pre>{logText || (selectedRun.logs.length ? '没有匹配的日志行。' : '暂无日志。')}</pre></div>
-      </section>}
+        <div className="run-bottom-log-heading"><div className="run-dock-tabs" role="tablist" aria-label="任务工具">{(['terminal', 'diff', 'review', 'logs'] as const).map(item => <button key={item} id={`dock-tab-${item}`} role="tab" aria-selected={dockTab === item} aria-controls={`dock-panel-${item}`} onClick={() => setDockTab(item)}>{({ terminal: 'Terminal', diff: 'Diff', review: 'Review', logs: '日志' })[item]}</button>)}</div><div className="run-log-actions">{dockTab === 'logs' && <><label className="run-log-filter"><Search aria-hidden="true" /><input type="search" value={logQuery} onChange={event => setLogQuery(event.target.value)} placeholder="过滤日志" aria-label="过滤运行日志" />{logQuery && <button type="button" title="清除日志过滤" aria-label="清除日志过滤" onClick={() => setLogQuery('')}><X aria-hidden="true" /></button>}</label><button className="run-copy-button" title="复制当前日志" aria-label="复制当前日志" onClick={() => void copyText(filteredLogs.join('\n'), 'log')}>{copiedKey === 'log' ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}</button></>}<button className="run-log-close" type="button" title="收起工具面板" aria-label="收起工具面板" onClick={toggleLogPanel}><X aria-hidden="true" /></button></div></div>
+        <div hidden={dockTab !== 'logs'} id="dock-panel-logs" role="tabpanel" aria-labelledby="dock-tab-logs"><div id="run-log-content" ref={logContentRef} className="run-bottom-log-content"><div className="run-log-summary">{filteredLogs.length > visibleLogs.length && <span>显示最近 {visibleLogs.length} 行</span>}</div><pre>{logText || (selectedRun.logs.length ? '没有匹配的日志行。' : '暂无日志。')}</pre></div>
+        </div>
+        <div hidden={dockTab !== 'terminal'} className="run-dock-content" id="dock-panel-terminal" role="tabpanel" aria-labelledby="dock-tab-terminal">{selectedRun.worktreePath ? <TerminalWorkbench key={`${selectedRun.id}:${selectedRun.worktreePath}`} active={logPanelVisible && dockTab === 'terminal'} projectPath={selectedRun.worktreePath} /> : <p className="console-empty">Worktree 尚未准备好，准备完成后可打开终端。</p>}</div>
+        {(dockTab === 'diff' || dockTab === 'review') && <div className="run-dock-content" id={`dock-panel-${dockTab}`} role="tabpanel" aria-labelledby={`dock-tab-${dockTab}`}><RunChangesPanel key={selectedRun.id} runId={selectedRun.id} review={dockTab === 'review'} /></div>}
+      </section>
     </>}
   </section>
 }
@@ -1044,6 +1073,10 @@ function activityTitle(event: AgentTraceEvent | undefined) {
   return compressActivityText(event.content ?? traceKindTitle(event.kind))
 }
 
+function traceKindTitle(kind: AgentTraceKind) {
+  return ({ reasoning_summary: '决策摘要', agent_message: 'Agent 消息', tool_started: '调用工具', tool_completed: '工具完成', status: '状态更新', error: '错误' })[kind]
+}
+
 function compressActivityText(value: string) {
   const single = value.replace(/\s+/g, ' ').trim()
   return single.length > 72 ? `${single.slice(0, 72)}…` : single
@@ -1054,67 +1087,6 @@ function sinceLabel(occurredAt: string) {
   if (!Number.isFinite(seconds)) return ''
   if (seconds < 60) return `${seconds}s 前`
   return `${Math.floor(seconds / 60)}m 前`
-}
-
-function buildAttemptTimeline(run: RunWorkspaceRun | null, node: RunNode | null, attempt: RunAttempt | null): TimelineItem[] {
-  if (!run || !node || !attempt) return []
-  const trace = (attempt.trace ?? []).filter(event => (!event.nodeId || event.nodeId === node.id) && (!event.attemptId || event.attemptId === attempt.id))
-  if (trace.length) {
-    return trace.map(event => ({
-      id: `${attempt.id}-trace-${event.seq}`,
-      occurredAt: event.occurredAt,
-      order: event.seq,
-      kind: event.kind,
-      label: traceKindLabel(event.kind),
-      title: traceKindTitle(event.kind),
-      toolName: event.toolName,
-      content: event.content,
-      command: event.command,
-      status: event.status,
-      exitCode: event.exitCode,
-      durationMs: event.durationMs,
-      truncated: event.truncated,
-      redacted: event.redacted,
-    })).sort(compareTimelineItems)
-  }
-
-  return run.events.filter(event => {
-    if (event.attemptId) return event.attemptId === attempt.id && (!event.nodeId || event.nodeId === node.id)
-    return node.attempts.length === 1 && event.nodeId === node.id
-  }).map((event, index) => {
-    const details = event.details ? { ...event.details } : undefined
-    const content = typeof details?.text === 'string' ? details.text : undefined
-    if (details && 'text' in details) delete details.text
-    return {
-      id: event.id,
-      occurredAt: event.occurredAt,
-      order: index,
-      kind: event.type,
-      label: eventTypeLabel(event.type),
-      title: event.message,
-      content,
-      details: details && Object.keys(details).length ? details : undefined,
-    }
-  }).sort(compareTimelineItems)
-}
-
-function compareTimelineItems(left: TimelineItem, right: TimelineItem) {
-  const leftTime = Date.parse(left.occurredAt)
-  const rightTime = Date.parse(right.occurredAt)
-  if (Number.isFinite(leftTime) && Number.isFinite(rightTime) && leftTime !== rightTime) return leftTime - rightTime
-  return left.order - right.order
-}
-
-function traceKindLabel(kind: AgentTraceKind) {
-  return ({ reasoning_summary: '决策摘要', agent_message: 'Agent 消息', tool_started: '工具开始', tool_completed: '工具完成', status: '状态', error: '错误' })[kind]
-}
-
-function traceKindTitle(kind: AgentTraceKind) {
-  return ({ reasoning_summary: 'Agent 更新了决策摘要', agent_message: 'Agent 公开说明', tool_started: '开始执行工具', tool_completed: '工具执行完成', status: '执行状态更新', error: '执行发生错误' })[kind]
-}
-
-function eventTypeLabel(type: RunEvent['type']) {
-  return ({ 'run-created': '运行', 'run-state': '状态', 'node-state': '节点', command: '命令', executor: '执行器', artifact: '产物', operator: '操作员', activity: '活动', error: '错误' })[type]
 }
 
 function formatTraceDuration(durationMs: number) {

@@ -1,8 +1,9 @@
 'use client'
 
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import Link from 'next/link'
 import { createPortal } from 'react-dom'
-import { AlignHorizontalSpaceAround, AppWindow, Bot, Check, ChevronLeft, ChevronRight, Copy, Download, Ellipsis, Eye, FilePenLine, FileText, Focus, FolderCog, Globe2, History, LoaderCircle, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, SquareTerminal, Upload, Workflow, X } from 'lucide-react'
+import { AlignHorizontalSpaceAround, AppWindow, Bot, Check, ChevronLeft, ChevronRight, Compass, Copy, Download, Ellipsis, Eye, FilePenLine, FileText, Focus, FolderCog, Globe2, History, LoaderCircle, Package, PanelBottom, PanelLeftClose, PanelLeftOpen, PanelRight, Play, Plus, Scan, Settings, SquareTerminal, Upload, Workflow, X } from 'lucide-react'
 import artifactLogo from './assets/artifact-logo.png'
 import { ExecutorSettings, SettingsOverview } from './executor-settings'
 import { latestActivity, RunWorkspace, type RunWorkspaceRun } from './run-workspace'
@@ -79,7 +80,7 @@ const initialNodes: WorkflowNode[] = [
   { id: 'review', title: '代码交付', subtitle: 'Git Diff', kind: '交付', tone: 'slate', state: 'idle', x: 1228, y: 154, input: 'validation', output: 'git-diff' },
 ]
 const initialEdges: Edge[] = [{ from: 'requirement', to: 'ui-spec' }, { from: 'ui-spec', to: 'approval' }, { from: 'approval', to: 'implementation' }, { from: 'implementation', to: 'validation' }, { from: 'validation', to: 'review' }]
-const navItems = [{ id: 'workflow', label: '工作流', icon: Workflow }, { id: 'runs', label: '运行', icon: History }, { id: 'artifacts', label: 'Artifacts', icon: Package }, { id: 'workbench', label: '工作台', icon: AppWindow }, { id: 'settings', label: '项目设置', icon: Settings }]
+const navItems = [{ id: 'runs', label: '工作区', icon: History }, { id: 'workflow', label: '任务模板', icon: Workflow }, { id: 'artifacts', label: 'Artifacts', icon: Package }, { id: 'workbench', label: '文件与终端', icon: AppWindow }, { id: 'settings', label: '项目设置', icon: Settings }]
 const nodePresets = [{ kind: 'Agent', title: 'Agent 节点', subtitle: 'Custom Agent', tone: 'violet', output: 'agent-report', executionMode: 'read_only' as const }, { kind: '验证', title: '验证节点', subtitle: 'Confirmed Commands', tone: 'green', output: 'test-report' }, { kind: '审批', title: '审批节点', subtitle: 'Human Approval', tone: 'amber', output: 'approved-spec' }, { kind: '工具', title: '工具节点', subtitle: 'Local Tool', tone: 'blue', output: 'tool-result' }]
 const outputSchemas = ['requirement', 'ui-spec', 'approved-spec', 'agent-report', 'code-change', 'test-report', 'git-diff', 'tool-result']
 const defaultSidebarWidth = 218
@@ -171,7 +172,7 @@ function arrangeWorkflowNodes(nodes: WorkflowNode[], edges: Edge[]): WorkflowNod
 }
 
 export default function HomePage() {
-  const [activeView, setActiveView] = useState('settings')
+  const [activeView, setActiveView] = useState('runs')
   const [theme, setTheme] = useState<InterfaceTheme>('dark')
   const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>('dark')
   const [themeReady, setThemeReady] = useState(false)
@@ -820,7 +821,7 @@ export default function HomePage() {
     <aside className="activity-bar" aria-label="主导航">
       <div className="activity-brand"><img className="brand-mark" src={artifactLogo.src} width={30} height={30} alt="Artifact" draggable={false} /></div>
       <nav className="activity-nav">
-        {navItems.map(item => { const Icon = item.icon; return <button key={item.id} title={item.label} aria-label={item.label} aria-current={activeView === item.id ? 'page' : undefined} className={activeView === item.id ? 'activity-item active' : 'activity-item'} onClick={() => selectView(item.id)}><Icon aria-hidden="true" /></button> })}
+        {navItems.map(item => { const Icon = item.icon; return <button key={item.id} title={item.label} aria-label={item.label} aria-current={activeView === item.id ? 'page' : undefined} className={activeView === item.id ? 'activity-item active' : 'activity-item'} onClick={() => selectView(item.id)}><Icon aria-hidden="true" /></button> })}<Link className="activity-item gridscape-link" href="/gridscape" title="GRIDSCAPE 概念画布" aria-label="GRIDSCAPE 概念画布"><Compass aria-hidden="true" /></Link>
       </nav>
       <div className="activity-bottom"><button className="activity-item" title="收起或展开侧栏" aria-label="收起或展开侧栏" aria-expanded={compactLayout ? activeCompactPanel === 'sidebar' : !sidebarCollapsed} onClick={toggleSidebar}>{compactLayout ? activeCompactPanel === 'sidebar' ? <PanelLeftClose aria-hidden="true" /> : <PanelLeftOpen aria-hidden="true" /> : sidebarCollapsed ? <PanelLeftOpen aria-hidden="true" /> : <PanelLeftClose aria-hidden="true" />}</button></div>
     </aside>

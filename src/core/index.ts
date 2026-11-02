@@ -70,6 +70,7 @@ export {
   rejectRun,
   requestRunInteraction,
   requestDeliveryApproval,
+  restoreDeletedDeliveryFiles,
   resumeRun,
   resumeInterruptedRuns,
   retryRun,
@@ -91,12 +92,16 @@ export {
 
 export {
   buildRepositoryMap,
+  executionStepContext,
+  agentInstructionContext,
   intentPrompt,
+  loadAgentInstructions,
   orchestrationReviewReason,
   parseIntentModelOutput,
   runStateGraph,
   textualAttachmentContext,
   type ExecutionPlan,
+  type AgentInstruction,
   type IntentOrchestrationSnapshot,
   type IntentSpec,
   type IntentTaskType,
@@ -119,6 +124,30 @@ export {
 } from '../storage-management'
 
 export { schemaFor, validatePayload, type JsonSchema } from '../artifact-schema'
+
+export {
+  assessPermission,
+  commandRisk,
+  withinWorkspace,
+  type PermissionDecision,
+  type PermissionMode,
+  type PermissionRequest,
+  type PermissionResult,
+  type ToolKind,
+  type ToolRisk,
+} from '../permission-policy'
+
+export {
+  AgentTool,
+  FileTool,
+  ShellTool,
+  type AgentToolInput,
+  type FileToolInput,
+  type ShellToolInput,
+  type ToolExecutionContext,
+  type ToolExecutionResult,
+  type ToolExecutor,
+} from '../tool-executor'
 
 export {
   listProjectFiles,
